@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 本项目运行时 ----
+runtime/
+logs/
+dist/
+data/
+service/.env
+*.log
+*.wav
+*.mp3
+
+# ---- 测试 ----
+.pytest_cache/
+tests/__pycache__/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

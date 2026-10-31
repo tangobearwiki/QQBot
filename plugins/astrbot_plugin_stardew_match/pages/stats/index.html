@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>星露谷匹配统计</title>
+    <link rel="stylesheet" href="./style.css?v=0.5.2" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>星露谷联机匹配</h1>
+          <p class="muted">实时统计 · 每 5 秒自动刷新</p>
+        </div>
+        <div class="topbar-actions">
+          <span id="updated" class="muted">加载中…</span>
+          <button id="refresh" type="button" class="button">刷新</button>
+        </div>
+      </header>
+
+      <div id="error" class="error" hidden></div>
+
+      <section class="cards">
+        <article class="card">
+          <span class="card-label">今日报名</span>
+          <strong id="signups" class="card-value">-</strong>
+          <span class="card-hint">人</span>
+        </article>
+        <article class="card">
+          <span class="card-label">今日匹配</span>
+          <strong id="matches" class="card-value">-</strong>
+          <span class="card-hint">次</span>
+        </article>
+        <article class="card">
+          <span class="card-label">匹配成功率</span>
+          <strong id="rate" class="card-value">-</strong>
+          <span class="card-hint">确认 / 匹配</span>
+        </article>
+        <article class="card">
+          <span class="card-label">排队中</span>
+          <strong id="waiting" class="card-value">-</strong>
+          <span class="card-hint">人</span>
+        </article>
+        <article class="card">
+          <span class="card-label">活跃群</span>
+          <strong id="groups" class="card-value">-</strong>
+          <span class="card-hint">个</span>
+        </article>
+        <article class="card">
+          <span class="card-label">待处理举报</span>
+          <strong id="reports" class="card-value">-</strong>
+          <span class="card-hint">条</span>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>各平台池排队</h2>
+            <span class="muted">平台 / 原版模组 / 人数 / 时段 / 性别偏好</span>
+          </div>
+          <div id="pools" class="pools"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>今日匹配趋势</h2>
+            <span class="muted">按小时</span>
+          </div>
+          <canvas id="hourlyChart" height="200"></canvas>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>最近匹配</h2>
+          <label class="filter-toggle">
+            <input id="showClosed" type="checkbox" />
+            显示已取消 / 已过期
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>双方</th>
+                <th>平台</th>
+                <th>模式</th>
+                <th>人数</th>
+                <th>状态</th>
+                <th>时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="recentBody">
+              <tr><td colspan="8" class="empty">暂无匹配记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel admin-panel">
+        <div class="panel-head">
+          <h2>管理操作</h2>
+          <span class="muted">仅 Dashboard 登录用户可用</span>
+        </div>
+
+        <div id="actionResult" class="action-result" hidden></div>
+
+        <div class="admin-grid">
+          <div class="admin-box">
+            <h3>房间检查</h3>
+            <button id="scanBtn" class="button primary" type="button">检查过期房间</button>
+            <p class="hint">满员会自动匹配；这里只清理等待超时的房间。强制满员会忽略人数条件。</p>
+          </div>
+
+          <div class="admin-box">
+            <h3>封禁 / 解封</h3>
+            <div class="field-row">
+              <input id="banQQ" inputmode="numeric" placeholder="QQ 号" />
+              <select id="banDuration">
+                <option value="3600">1 小时</option>
+                <option value="86400">1 天</option>
+                <option value="604800">7 天</option>
+                <option value="0">永久</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <input id="banReason" placeholder="原因（可选）" />
+              <button id="banBtn" class="button danger" type="button">封禁</button>
+            </div>
+            <div class="field-row">
+              <input id="unbanQQ" inputmode="numeric" placeholder="QQ 号" />
+              <button id="unbanBtn" class="button" type="button">解封</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="admin-box">
+          <h3>开放房间</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>房间</th>
+                  <th>目标</th>
+                  <th>当前</th>
+                  <th>成员</th>
+                  <th>还差</th>
+                  <th>等待</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="roomBody">
+                <tr><td colspan="7" class="empty">暂无开放房间</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-box">
+          <h3>待处理举报</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>举报人</th>
+                  <th>被举报人</th>
+                  <th>原因</th>
+                  <th>时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="reportBody">
+                <tr><td colspan="6" class="empty">暂无举报</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="roomModal" class="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="roomModalTitle">
+        <div class="modal-head">
+          <h3 id="roomModalTitle">房间条件</h3>
+          <button id="roomModalClose" class="modal-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="roomModalBody" class="modal-body"></div>
+      </div>
+    </div>
+
+    <script src="./app.js?v=0.5.2"></script>
+  </body>
+</html>

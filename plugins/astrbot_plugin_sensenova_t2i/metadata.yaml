@@ -1,0 +1,6 @@
+id: astrbot_plugin_sensenova_t2i
+name: 商汤日日新生图（SenseNova）
+author: serUNzmcsYXp2R1
+desc: 基于商汤日日新 SenseNova U1.5 的 AI 生图与改图。/画图、/改图 命令；注册 sensenova_text_to_image 与 sensenova_image_edit 工具，配合意图引导，群友自然语言即可生成或修改图片。
+version: v1.1.0
+repo: local

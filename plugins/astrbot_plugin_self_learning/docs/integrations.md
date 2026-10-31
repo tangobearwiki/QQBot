@@ -1,0 +1,276 @@
+# 功能融合
+
+Self Learning 负责学习、审查、黑话、表达方式和 LLM 上下文注入。长期记忆交给 LivingMemory，回复决策和生成交给 Group Chat Plus。
+
+## 职责边界
+
+| 能力 | 默认归属 | 委托后行为 |
+| --- | --- | --- |
+| 消息采集 | Self Learning | 保持不变 |
+| 人格审查 | Self Learning | 保持不变 |
+| 风格审查 | Self Learning | 保持不变 |
+| 黑话学习 | Self Learning | 保持不变 |
+| few-shot 注入 | Self Learning | 保持不变 |
+| 长期记忆写入 | Self Learning | LivingMemory 已加载时跳过本地写入 |
+| 长期记忆注入 | Self Learning | LivingMemory 已加载时跳过本地 V2 记忆注入 |
+| 回复决策 | Self Learning 兼容回复器 | Group Chat Plus 已加载时跳过本地回复器 |
+| 回复生成 | Self Learning 兼容回复器 | Group Chat Plus 已加载时跳过本地回复器 |
+
+## 配置
+
+配置组: `Integration_Settings`
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `delegate_memory_to_livingmemory` | `true` | 允许把长期记忆委托给 LivingMemory |
+| `livingmemory_plugin_name` | `LivingMemory` | LivingMemory 检测名 |
+| `disable_local_memory_when_delegated` | `true` | 委托生效时禁用本地长期记忆写入和注入 |
+| `delegate_reply_to_group_chat_plus` | `true` | 允许把回复决策和生成委托给 Group Chat Plus |
+| `group_chat_plus_plugin_name` | `astrbot_plugin_group_chat_plus` | Group Chat Plus 检测名 |
+| `disable_local_reply_when_delegated` | `true` | 委托生效时禁用本地回复器 |
+
+检测别名:
+
+- LivingMemory: `LivingMemory`, `astrbot_plugin_livingmemory`
+- Group Chat Plus: `astrbot_plugin_group_chat_plus`, `Group Chat Plus`, `ChatPlus`
+
+委托只在目标插件已加载、激活且存在 `star_cls` 时生效。未检测到目标插件时，本插件自动回退到本地能力。
+
+成本提示: 如果 V2 架构同时选择 `knowledge_engine="lightrag"`、
+`lightrag_query_mode="hybrid"`/`"mix"`，并开启 LivingMemory 记忆委托，
+一次上下文增强可能同时触发 LightRAG 全局/混合检索与 LivingMemory 记忆检索。
+设置页和功能融合页会显示非阻塞提醒。需要控制成本时，优先将 LightRAG 查询模式改为
+`local`/`naive`，或只保留一种记忆/检索策略。
+
+## 运行路径
+
+### 记忆委托
+
+```python
+feature_delegation.should_delegate_memory()
+```
+
+调用点:
+
+- `services/core_learning/v2_learning_integration.py`: 跳过本地 memory engine 写入和检索。
+- `services/hooks/llm_hook_handler.py`: 跳过本地 V2 记忆上下文注入。
+- `services/persona/persona_updater.py`: 跳过本地记忆图谱更新。
+
+### 回复委托
+
+```python
+feature_delegation.should_delegate_reply()
+```
+
+调用点:
+
+- `core/plugin_lifecycle.py`: 跳过本地 `IntelligentResponder` 创建和启动。
+
+## Dashboard
+
+入口:
+
+```text
+Dashboard -> 功能融合
+```
+
+页面内容:
+
+- Self Learning 当前面板。
+- LivingMemory 状态、官方插件页/外部面板入口和本地图谱适配 API 列表。
+- Group Chat Plus 状态、面板入口和开发 API 列表。
+- `Integration_Settings` 快速编辑。
+- Self Learning Hub 稳定 HTTP 契约和可对接能力。
+
+## Self Learning Hub
+
+Self Learning 现在也可以作为学习中枢供其他插件调用。伴随插件可以把“构建上下文”“引用一段对话并学习”“写入外部消息”“触发学习”“读取审查/图谱/指标”视为稳定 HTTP 能力，而不是直接依赖本插件内部 Python 对象。
+
+### 发现方式
+
+优先读取功能融合状态:
+
+```http
+GET /api/integrations/status
+```
+
+返回中的 `hub` 字段包含 `base_path`、`manifest_url`、`status_url`、`auth`、`capabilities` 和 `endpoints`。
+
+也可以直接读取:
+
+```http
+GET /api/hub/v1/manifest
+GET /api/hub/v1/status
+```
+
+### 推荐调用顺序
+
+1. 读取 `manifest`，确认版本、鉴权和 endpoint 列表。
+2. 读取 `status`，检查数据库和能力是否可用。
+3. 调用 `context` 构建 prompt-ready 上下文。
+4. 需要学习时调用 `memories/remember` 或 `messages/ingest`。
+5. 需要编排学习过程时调用 `learning/trigger`。
+
+## WebUI API
+
+### `GET /api/integrations/status`
+
+返回:
+
+```json
+{
+  "delegation": {
+    "memory_delegated": true,
+    "memory_plugin": "LivingMemory",
+    "reply_delegated": true,
+    "reply_plugin": "Group Chat Plus"
+  },
+  "settings": {
+    "delegate_memory_to_livingmemory": true,
+    "livingmemory_plugin_name": "LivingMemory",
+    "disable_local_memory_when_delegated": true,
+    "delegate_reply_to_group_chat_plus": true,
+    "group_chat_plus_plugin_name": "astrbot_plugin_group_chat_plus",
+    "disable_local_reply_when_delegated": true
+  },
+  "dashboards": [],
+  "hub": {
+    "base_path": "/api/hub/v1",
+    "manifest_url": "/api/hub/v1/manifest",
+    "status_url": "/api/hub/v1/status",
+    "endpoints": []
+  }
+}
+```
+
+`dashboards[]` 字段:
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | `self_learning`, `livingmemory`, `group_chat_plus` |
+| `title` | 面板标题 |
+| `role` | 插件职责 |
+| `active` | 是否检测到插件 |
+| `delegated` | 当前能力是否已委托 |
+| `plugin` | AstrBot star 元信息 |
+| `status` | 运行状态标识：`healthy`（`true`/`false`/`null`=未知）、`state`（`ok`/`degraded`/`offline`/`not_installed`/`unknown`）、`message`（人读原因）。Group Chat Plus 会对面板端口做可达性探测（结果缓存 60 秒）；LivingMemory 以插件是否加载为准 |
+| `dashboard` | 面板入口：`external_url`（新窗口打开的独立面板/官方面板链接）、`route`（本监控板内路由，如 LivingMemory 的 `#/graphs`）、`label`。插件面板不再以 iframe 内嵌（issue #271：GCP v1.2.x 固定 `X-Frame-Options: DENY`、AstrBot 官方插件页固定 `SAMEORIGIN`，内嵌必被浏览器拦截），一律新窗口打开 |
+| `dashboard.official_page_url` | 伴随插件自带 AstrBot 官方插件页时的入口（LivingMemory 2.6.0+）。指向 AstrBot Dashboard 前端 hash 路由 `/#/plugin-page/<插件名>/<页名>`（v4.29 起 `/#/plugin-view/...`），由集成服务探测插件 `views|pages/<页名>/index.html` 与主配置 `dashboard.host/port` 自动生成；该页面需 AstrBot 会话 JWT，只能新窗口打开 |
+| `dev_api` | 该插件公开 API 列表 |
+| `settings_group` | 相关配置组 |
+
+### Hub API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/hub/v1/manifest` | Hub 契约、能力列表、MVC/AOP 说明和请求示例 |
+| GET | `/api/hub/v1/status` | 健康状态、数据库降级状态、集成状态和可用能力 |
+| POST | `/api/hub/v1/context` | 构建 prompt-ready 上下文 |
+| POST | `/api/hub/v1/memories/remember` | 写入用户显式选择的记忆，并链入表达方式和示例样本 |
+| POST | `/api/hub/v1/messages/ingest` | 接收外部插件标准化消息，进入学习管道 |
+| POST | `/api/hub/v1/learning/trigger` | 触发指定群组学习 |
+| GET | `/api/hub/v1/reviews` | 获取待审队列 |
+| POST | `/api/hub/v1/reviews/<review_id>/decision` | 提交审查决定 |
+| GET | `/api/hub/v1/graphs/memory` | 读取记忆图 |
+| GET | `/api/hub/v1/graphs/knowledge` | 读取知识图 |
+| GET | `/api/hub/v1/metrics` | 读取 Hub 级指标 |
+
+## Companion API 列表
+
+### Self Learning
+
+- `GET /api/integrations/status`
+- `POST /api/integrations/worldbook/preview`
+- `POST /api/integrations/worldbook/import`
+- `GET /api/integrations/worldbook/imports`
+- `GET /api/hub/v1/manifest`
+- `GET /api/hub/v1/status`
+- `POST /api/hub/v1/context`
+- `POST /api/hub/v1/memories/remember`
+- `POST /api/hub/v1/messages/ingest`
+- `POST /api/hub/v1/learning/trigger`
+- `GET /api/hub/v1/reviews`
+- `POST /api/hub/v1/reviews/<review_id>/decision`
+- `GET /api/hub/v1/graphs/memory`
+- `GET /api/hub/v1/graphs/knowledge`
+- `GET /api/hub/v1/metrics`
+- `GET /api/config/schema`
+- `POST /api/config`
+- `GET /api/metrics`
+- `GET /api/graphs/memory`
+- `GET /api/graphs/knowledge`
+- `GET /api/persona_updates`
+- `GET /api/jargon/list`
+- `GET /api/style_learning/content_text`
+
+## SillyTavern 世界书导入
+
+Self Learning 支持导入 SillyTavern 世界书 JSON。导入器接受标准格式:
+
+```json
+{
+  "name": "世界书名称",
+  "entries": {
+    "0": {
+      "key": ["关键词"],
+      "secondaryKeys": ["辅助关键词"],
+      "content": "设定正文",
+      "constant": false,
+      "order": 100,
+      "insertion_order": 0
+    }
+  }
+}
+```
+
+`entries` 也可以是数组。当前导入路径复用现有表:
+
+- `content` 写入 `persona_update_reviews`，作为 `worldbook_entry` 待审记忆。
+- `key` 和 `secondaryKeys` 写入 `jargon` 候选池。
+- 世界书条目、关键词及触发关系写入 `kg_entities` 和 `kg_relations`。
+
+导入历史通过 `GET /api/integrations/worldbook/imports` 从审查记录
+metadata 聚合，不需要额外迁移表。
+
+### LivingMemory
+
+Self Learning 不再调用 LivingMemory 的 Page 图谱 API。Dashboard 的
+`#/graphs` 模块会在 LivingMemory 已加载时直读其
+`initializer.memory_engine.graph_store` 后端对象，并通过本插件接口暴露
+ECharts 图谱 payload。记忆图和知识图谱都会优先读取 LivingMemory 后端；
+当后端不可用或快照为空时，仍保留 Self Learning 本地记忆、LightRAG 和
+本地 KG 表作为回退方案:
+
+- `GET /api/graphs/memory`
+- `GET /api/graphs/knowledge`
+
+### Group Chat Plus
+
+- `POST /api/auth/login`
+- `GET /api/auth/status`
+- `GET /api/config`
+- `PUT /api/config`
+- `POST /api/config/reload`
+- `GET /api/data/overview`
+- `GET /api/data/status`
+- `GET /api/session/list`
+- `POST /api/session/clean-ghosts`
+- `GET /api/security/access-log`
+
+## 排查
+
+| 现象 | 检查 |
+| --- | --- |
+| Dashboard 显示未委托 | 目标插件是否已加载、启用、名称是否匹配 |
+| LivingMemory 已安装但仍写入本地记忆 | `delegate_memory_to_livingmemory` 和 `disable_local_memory_when_delegated` 是否为 `true` |
+| Group Chat Plus 已安装但仍创建本地回复器 | `delegate_reply_to_group_chat_plus` 和 `disable_local_reply_when_delegated` 是否为 `true` |
+| 面板入口为空 | 目标插件 Web 面板是否开启；LivingMemory 2.6.0+ 由集成服务自动探测其官方插件页（`pages/` 目录 + AstrBot 主配置 `dashboard` 段），图谱模块仍可通过本插件 `/api/graphs/*` 查看 |
+| Group Chat Plus 嵌入壳显示"面板禁止内嵌" | 该面板自 v1.2.x 起返回 `X-Frame-Options: DENY`，无法被 iframe 嵌入，属预期行为；集成服务会探测响应头并自动改用新窗口入口 |
+| LivingMemory 嵌入壳显示"面板禁止内嵌" | AstrBot 官方插件页固定返回 `X-Frame-Options: SAMEORIGIN` 且资产需 JWT 换取，iframe 内无法携带凭据，属预期行为；请用嵌入壳或功能融合页的「官方面板」新窗口打开 |
+| API 列表不匹配 | 以目标插件当前开发 API 为准，更新 `webui/services/integration_service.py` |
+
+## 测试
+
+```powershell
+python -m pytest tests\unit\test_feature_delegation.py tests\unit\test_integration_service.py tests\integration\test_webui_static_assets.py
+```

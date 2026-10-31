@@ -1,0 +1,6 @@
+id: astrbot_plugin_smapi_log_analyzer
+name: SMAPI 日志分析
+author: serUNzmcsYXp2R1
+desc: 自动识别群里的 smapi.io/log 日志链接，用大模型综合成自然语言诊断与修复建议（规则解析兜底）；支持 /smapi 命令与 smapi_log_analysis 大模型工具。
+version: v2.0.0
+repo: local

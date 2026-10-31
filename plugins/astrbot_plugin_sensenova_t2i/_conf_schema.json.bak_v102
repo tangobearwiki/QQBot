@@ -1,0 +1,22 @@
+{
+  "api_key": {
+    "description": "SenseNova API Key（sk- 开头）",
+    "type": "string",
+    "default": ""
+  },
+  "model": {
+    "description": "生图模型 ID",
+    "type": "string",
+    "default": "sensenova-u1.5-lite"
+  },
+  "timeout": {
+    "description": "生图请求超时（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "nl_intent_guide": {
+    "description": "自然语言生图意图引导：开启后会在大模型系统提示词中注入生图指令，确保检测到生图意图时稳定调用工具生图",
+    "type": "bool",
+    "default": true
+  }
+}

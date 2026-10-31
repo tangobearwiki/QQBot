@@ -1,0 +1,5 @@
+name: astrbot_plugin_stardew_match
+display_name: 星露谷联机匹配
+desc: 星露谷物语联机匹配：按目标人数和我方人数聚合房间，跨群匹配，加入即通知，满员直接交换联系方式。
+version: 0.5.0
+author: dsh

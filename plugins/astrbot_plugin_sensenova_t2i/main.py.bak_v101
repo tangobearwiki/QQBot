@@ -1,0 +1,181 @@
+import asyncio
+import base64
+import json
+import os
+import urllib.request
+
+import aiohttp
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image as CompImage, Plain
+from astrbot.api.star import Context, Star, register
+from astrbot.core.config.astrbot_config import AstrBotConfig
+
+API_URL = "https://token.sensenova.cn/v1/images/generations"
+
+SIZE_MAP = {
+    "1:1": "1024x1024",
+    "16:9": "1344x768",
+    "9:16": "768x1344",
+    "4k": "2688x1536",
+    "高清": "2688x1536",
+}
+USAGE_TEXT = (
+    "用法：/画图 <描述> [--1:1|--16:9|--9:16|--4k]\n"
+    "例：/画图 雪山下的星空营地 --16:9"
+)
+TOKEN_TO_SIZE = {
+    "--1:1": "1024x1024",
+    "--1k": "1024x1024",
+    "--16:9": "1344x768",
+    "--横版": "1344x768",
+    "--9:16": "768x1344",
+    "--竖版": "768x1344",
+    "--4k": "2688x1536",
+    "--高清": "2688x1536",
+}
+AR_TO_SIZE = {"1:1": "1024x1024", "16:9": "1344x768", "9:16": "768x1344"}
+CMD_TOKENS = {"画图", "生成图片"}
+
+
+@register(
+    "astrbot_plugin_sensenova_t2i",
+    "serUNzmcsYXp2R1",
+    "商汤日日新生图（SenseNova）",
+    "1.0.1",
+    "基于商汤日日新 SenseNova U1.5 的 AI 生图。/画图 命令直接生图；注册 sensenova_text_to_image 工具供大模型自动生图。",
+)
+class SenseNovaT2IPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.context = context
+        self.cfg = config
+
+    # ---------------- 核心：生成 + 下载 ----------------
+
+    def _resolve_key(self) -> str:
+        key = str(self.cfg.get("api_key") or "").strip()
+        if not key:
+            key = str(os.environ.get("SENSENOVA_API_KEY") or "").strip()
+        return key
+
+    async def _generate(self, prompt: str, size: str) -> tuple[str | None, str | None]:
+        """调用日日新生图 API，返回 (图片URL, 错误)。"""
+        api_key = self._resolve_key()
+        if not api_key:
+            return None, "未配置 SenseNova API Key（插件配置 api_key 或环境变量 SENSENOVA_API_KEY）"
+        payload = {
+            "model": str(self.cfg.get("model") or "sensenova-u1.5-lite"),
+            "prompt": prompt[:1000],
+            "size": size,
+            "response_format": "url",
+            "output_format": "png",
+            "watermark": False,
+        }
+        timeout = aiohttp.ClientTimeout(total=int(self.cfg.get("timeout") or 180))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    API_URL,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status != 200:
+                        text = (await resp.text())[:200]
+                        return None, f"API 返回 {resp.status}: {text}"
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"[日日新生图] 请求失败: {e}")
+            return None, f"请求异常: {e}"
+        urls = [d.get("url") for d in (data.get("data") or []) if d.get("url")]
+        if not urls:
+            return None, "接口未返回图片 URL"
+        return urls[0], None
+
+    @staticmethod
+    def _download_sync(url: str, timeout: int = 60) -> bytes:
+        """用 urllib 直接拉取签名 URL 字节（绕开 aiohttp/yarl 重编码导致的 OSS 403）。"""
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status != 200:
+                raise RuntimeError(f"下载失败 HTTP {r.status}")
+            return r.read()
+
+    async def _fetch_image_bytes(self, url: str) -> tuple[bytes | None, str | None]:
+        try:
+            data = await asyncio.to_thread(self._download_sync, url)
+            if not data or not data.startswith(b"\x89PNG"):
+                return None, "下载内容不是有效图片"
+            return data, None
+        except Exception as e:
+            logger.error(f"[日日新生图] 图片下载失败: {e}")
+            return None, f"图片下载失败: {e}"
+
+    # ---------------- 参数解析 ----------------
+
+    @staticmethod
+    def _parse_draw_args(message_str: str) -> tuple[str, str]:
+        """从消息解析出 (提示词, 尺寸)，剥离命令词与尺寸旗标。"""
+        tokens = message_str.strip().split()
+        size = "1024x1024"
+        kept = []
+        for t in tokens:
+            low = t.lower()
+            if low in TOKEN_TO_SIZE or t in TOKEN_TO_SIZE:
+                size = TOKEN_TO_SIZE.get(low) or TOKEN_TO_SIZE.get(t) or size
+                continue
+            if t in CMD_TOKENS and not kept:
+                continue
+            kept.append(t)
+        return " ".join(kept).strip(), size
+
+    # ---------------- /画图 命令 ----------------
+
+    @filter.command("画图", alias={"生成图片"})
+    async def draw(self, event: AstrMessageEvent):
+        """AI 生图：/画图 描述 [--16:9 等]"""
+        prompt, size = self._parse_draw_args(event.message_str)
+        if len(prompt) < 2:
+            yield event.plain_result(USAGE_TEXT)
+            return
+        # 首个 yield 立即返回，占位并终止管道进入 LLM 阶段
+        yield event.plain_result(f"🎨 正在生成图片（{size}），约需 20-60 秒，请稍候…")
+        url, err = await self._generate(prompt, size)
+        if not url:
+            yield event.plain_result(f"❌ 生图失败：{err}")
+            return
+        data, derr = await self._fetch_image_bytes(url)
+        if not data:
+            yield event.plain_result(f"❌ {derr}（原图 24h 内有效：{url[:80]}…）")
+            return
+        caption = Plain(f"\n🎨 {prompt[:80]}" + ("（高清）" if size == "2688x1536" else ""))
+        yield event.chain_result([CompImage.fromBase64(base64.b64encode(data).decode()), caption])
+
+    # ---------------- LLM 生图工具 ----------------
+
+    @filter.llm_tool(name="sensenova_text_to_image")
+    async def sensenova_text_to_image(
+        self, event: AstrMessageEvent, prompt: str, aspect_ratio: str = "1:1"
+    ):
+        """使用商汤日日新模型生成图片并发送。当用户想要画图、生成图片、插画、海报、表情包等图像创作需求时调用。
+        Args:
+            prompt(string): 图像描述提示词，建议写清主体、场景、风格与细节
+            aspect_ratio(string): 画面比例，可选 1:1、16:9、9:16，默认 1:1
+        """
+        size = AR_TO_SIZE.get(str(aspect_ratio).strip(), "1024x1024")
+        url, err = await self._generate(prompt, size)
+        if not url:
+            return f"生图失败：{err}"
+        data, derr = await self._fetch_image_bytes(url)
+        if not data:
+            return f"图片已生成但发送失败：{derr}"
+        await event.send(event.chain_result([CompImage.fromBase64(base64.b64encode(data).decode())]))
+        return "图片已生成并发送给用户。"
+
+    async def terminate(self):
+        pass

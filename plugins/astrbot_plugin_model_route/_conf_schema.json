@@ -1,0 +1,31 @@
+{
+  "text_provider_id": {
+    "type": "string",
+    "description": "普通用户纯文本 LLM Provider（默认商汤 glm-5.2）",
+    "default": "Sensenova/glm-5.2",
+    "_special": "select_provider"
+  },
+  "multimodal_provider_id": {
+    "type": "string",
+    "description": "普通用户图片、视频或引用媒体消息的 LLM Provider",
+    "default": "Ark/ark-code-latest",
+    "_special": "select_provider"
+  },
+  "enable_sponsor_priority": {
+    "type": "bool",
+    "description": "启用后，有效个人赞助者的 LLM 请求优先使用赞助者 Provider（默认 Ark）",
+    "default": true
+  },
+  "sponsor_min_tier": {
+    "type": "int",
+    "description": "享受优先路由的最低个人档位：1 支持者、2 高级支持者、3 共创支持者；群组赞助不共享给成员",
+    "default": 1,
+    "options": [1, 2, 3]
+  },
+  "sponsor_provider_id": {
+    "type": "string",
+    "description": "有效个人赞助者优先使用的 LLM Provider，默认 Ark ark-code-latest",
+    "default": "Ark/ark-code-latest",
+    "_special": "select_provider"
+  }
+}

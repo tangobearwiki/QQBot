@@ -1,0 +1,2710 @@
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import re
+import time
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import aiosqlite
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import At, Plain
+from astrbot.api.star import Context, Star
+
+PLUGIN_DIR = Path(__file__).resolve().parent
+DATA_DIR = PLUGIN_DIR / "data"
+DB_PATH = DATA_DIR / "match.db"
+REG_PATH = DATA_DIR / "reg_state.json"
+
+
+def _load_room_manager():
+    spec = importlib.util.spec_from_file_location(
+        "astrbot_plugin_stardew_match_rooms",
+        PLUGIN_DIR / "rooms.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RoomManager
+
+
+RoomManager = _load_room_manager()
+
+POOLS = {
+    "pc": "PC（Steam/GOG）",
+    "mobile": "手机（iOS/Android）",
+    "switch": "Switch",
+    "playstation": "PlayStation",
+    "xbox": "Xbox",
+}
+POOL_ALIASES = {
+    "1": "pc",
+    "pc": "pc",
+    "电脑": "pc",
+    "steam": "pc",
+    "gog": "pc",
+    "2": "mobile",
+    "手机": "mobile",
+    "ios": "mobile",
+    "android": "mobile",
+    "安卓": "mobile",
+    "3": "switch",
+    "switch": "switch",
+    "ns": "switch",
+    "4": "playstation",
+    "ps": "playstation",
+    "ps4": "playstation",
+    "ps5": "playstation",
+    "playstation": "playstation",
+    "5": "xbox",
+    "xbox": "xbox",
+}
+
+SLOTS = {"morning": "上午", "afternoon": "下午", "evening": "晚上", "late": "深夜"}
+SLOT_ALIASES = {
+    "1": "morning",
+    "上午": "morning",
+    "早上": "morning",
+    "morning": "morning",
+    "2": "afternoon",
+    "下午": "afternoon",
+    "afternoon": "afternoon",
+    "3": "evening",
+    "晚上": "evening",
+    "evening": "evening",
+    "4": "late",
+    "深夜": "late",
+    "凌晨": "late",
+    "late": "late",
+}
+
+Q_POOL = (
+    "【1/9】请选择平台：\n"
+    "1 PC（Steam/GOG）\n"
+    "2 手机（iOS/Android）\n"
+    "3 Switch\n"
+    "4 PlayStation\n"
+    "5 Xbox\n"
+    "回复数字"
+)
+Q_MODDED = "【2/9】原版还是模组？\n1 原版\n2 模组\n回复数字"
+Q_SLOTS = (
+    "【3/9】可玩时段（可多选，逗号分隔）：\n"
+    "1 上午\n2 下午\n3 晚上\n4 深夜\n"
+    "例如：3,4"
+)
+Q_TARGET = (
+    "【4/9】想凑到几人？\n"
+    "2 两人房\n"
+    "3 三人房\n"
+    "4 四人房\n"
+    "回复数字 2-4"
+)
+Q_HAVE = "【5/9】你这边已有几人（含自己）？\n回复 1 到 {max_have}"
+Q_GENDER = "【6/9】你的性别？\n1 男\n2 女\n3 保密"
+Q_PREFER = "【7/9】希望匹配到的对方性别？\n1 男\n2 女\n3 不限"
+Q_QQ = "【8/9】联系 QQ（回复数字；发送“默认”使用当前 QQ）："
+Q_STEAM = "【9/9】Steam 好友码（可选；发送“跳过”）："
+
+BACK_HINT = "\n\n（回复“上一步”可返回上一题修改）"
+
+STEPS = [
+    "pool",
+    "modded",
+    "slots",
+    "target",
+    "have",
+    "gender",
+    "prefer_gender",
+    "qq",
+    "steam",
+    "confirm",
+]
+STEP_FIELDS = {
+    "pool": "pool",
+    "modded": "modded",
+    "slots": "slots",
+    "target": "target",
+    "have": "have",
+    "gender": "gender",
+    "prefer_gender": "prefer_gender",
+    "qq": "contact_qq",
+    "steam": "contact_steam",
+}
+STEP_QUESTIONS = {
+    "pool": Q_POOL,
+    "modded": Q_MODDED,
+    "slots": Q_SLOTS,
+    "target": Q_TARGET,
+    "have": Q_HAVE,
+    "gender": Q_GENDER,
+    "prefer_gender": Q_PREFER,
+    "qq": Q_QQ,
+    "steam": Q_STEAM,
+}
+GENDERS = {"male": "男", "female": "女", "secret": "保密"}
+GENDER_ALIASES = {
+    "1": "male",
+    "男": "male",
+    "male": "male",
+    "m": "male",
+    "2": "female",
+    "女": "female",
+    "female": "female",
+    "f": "female",
+    "3": "secret",
+    "保密": "secret",
+    "secret": "secret",
+    "不公开": "secret",
+}
+PREFERS = {"male": "男", "female": "女", "any": "不限"}
+PREFER_ALIASES = {
+    "1": "male",
+    "男": "male",
+    "male": "male",
+    "2": "female",
+    "女": "female",
+    "female": "female",
+    "3": "any",
+    "不限": "any",
+    "any": "any",
+    "都可以": "any",
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS players (
+    qq TEXT PRIMARY KEY,
+    nickname TEXT DEFAULT '',
+    pool TEXT NOT NULL,
+    modded INTEGER NOT NULL DEFAULT 0,
+    time_slots TEXT NOT NULL,
+    party_size INTEGER NOT NULL,
+    gender TEXT NOT NULL DEFAULT 'secret',
+    prefer_gender TEXT NOT NULL DEFAULT 'any',
+    contact_qq TEXT NOT NULL,
+    contact_steam TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'idle',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    qq TEXT NOT NULL,
+    nickname TEXT DEFAULT '',
+    pool TEXT NOT NULL,
+    modded INTEGER NOT NULL,
+    time_slots TEXT NOT NULL,
+    party_size INTEGER NOT NULL,
+    gender TEXT NOT NULL DEFAULT 'secret',
+    prefer_gender TEXT NOT NULL DEFAULT 'any',
+    group_id TEXT DEFAULT '',
+    enqueued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting'
+);
+CREATE TABLE IF NOT EXISTS matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_a TEXT NOT NULL,
+    player_b TEXT NOT NULL,
+    pool TEXT NOT NULL,
+    modded INTEGER NOT NULL,
+    party_size INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    forced INTEGER NOT NULL DEFAULT 0,
+    confirm_a INTEGER NOT NULL DEFAULT 0,
+    confirm_b INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    confirm_deadline TEXT NOT NULL,
+    group_a TEXT DEFAULT '',
+    group_b TEXT DEFAULT '',
+    closed_at TEXT DEFAULT '',
+    close_reason TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter TEXT NOT NULL,
+    target TEXT NOT NULL,
+    reason TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+);
+CREATE TABLE IF NOT EXISTS bans (
+    qq TEXT PRIMARY KEY,
+    reason TEXT DEFAULT '',
+    until TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    created_by TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS groups (
+    group_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rooms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target INTEGER NOT NULL,
+    pool TEXT NOT NULL,
+    modded INTEGER NOT NULL,
+    time_slots TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    group_id TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS room_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL,
+    qq TEXT NOT NULL,
+    nickname TEXT DEFAULT '',
+    have INTEGER NOT NULL,
+    need INTEGER NOT NULL,
+    gender TEXT DEFAULT 'secret',
+    prefer_gender TEXT DEFAULT 'any',
+    contact_qq TEXT NOT NULL,
+    contact_steam TEXT DEFAULT '',
+    group_id TEXT DEFAULT '',
+    joined_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status, target);
+CREATE INDEX IF NOT EXISTS idx_room_members_room ON room_members(room_id, active);
+CREATE INDEX IF NOT EXISTS idx_room_members_qq ON room_members(qq, active);
+CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_queue_pool ON queue(pool, modded, status);
+CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status);
+CREATE INDEX IF NOT EXISTS idx_bans_until ON bans(until);
+"""
+
+
+class StardewMatchPlugin(Star):
+    def __init__(self, context: Context, config: dict | None = None):
+        super().__init__(context, config)
+        self.config = config or {}
+        self.reg: dict[str, dict] = {}
+        self.reco: dict[str, dict] = {}
+        self.bot = None
+        self.cooldowns: dict[str, float] = {}
+        self._task: asyncio.Task | None = None
+        self._running = False
+        self._lock = asyncio.Lock()
+        self.rooms = RoomManager(self)
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    async def initialize(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._reg_load()
+        await self._init_db()
+        try:
+            self.context.register_web_api(
+                "/astrbot_plugin_stardew_match/stats",
+                self._page_stats,
+                ["GET"],
+                "星露谷匹配统计",
+            )
+            self.context.register_web_api(
+                "/astrbot_plugin_stardew_match/admin",
+                self._page_admin,
+                ["POST"],
+                "星露谷匹配管理",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[星露谷匹配] 注册统计页面 API 失败")
+        self._running = True
+        self._task = asyncio.create_task(self._match_loop())
+        logger.info("[星露谷匹配] 插件已启动，数据库：%s", DB_PATH)
+
+    async def terminate(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        logger.info("[星露谷匹配] 插件已停止")
+
+    async def _init_db(self):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.executescript(SCHEMA)
+            await db.commit()
+        await self._migrate_db()
+
+    async def _migrate_db(self):
+        async with self._db() as db:
+            for table in ("players", "queue"):
+                rows = await (
+                    await db.execute(f"PRAGMA table_info({table})")
+                ).fetchall()
+                columns = {row["name"] for row in rows}
+                if "gender" not in columns:
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN gender TEXT NOT NULL DEFAULT 'secret'"
+                    )
+                if "prefer_gender" not in columns:
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN prefer_gender TEXT NOT NULL DEFAULT 'any'"
+                    )
+                if "nickname" not in columns:
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN nickname TEXT DEFAULT ''"
+                    )
+            match_columns = {
+                row["name"]
+                for row in await (
+                    await db.execute("PRAGMA table_info(matches)")
+                ).fetchall()
+            }
+            if "forced" not in match_columns:
+                await db.execute(
+                    "ALTER TABLE matches ADD COLUMN forced INTEGER NOT NULL DEFAULT 0"
+                )
+            if "room_id" not in match_columns:
+                await db.execute(
+                    "ALTER TABLE matches ADD COLUMN room_id INTEGER NOT NULL DEFAULT 0"
+                )
+            await db.commit()
+
+    @asynccontextmanager
+    async def _db(self):
+        db = await aiosqlite.connect(DB_PATH)
+        db.row_factory = aiosqlite.Row
+        try:
+            yield db
+        finally:
+            await db.close()
+
+    def _reg_save(self) -> None:
+        """问卷进度落盘，重启后可续答。"""
+        try:
+            REG_PATH.write_text(
+                json.dumps(self.reg, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("[星露谷匹配] 报名进度落盘失败: %s", exc)
+
+    def _reg_load(self) -> None:
+        try:
+            data = json.loads(REG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.reg = data
+        except (OSError, ValueError):
+            pass
+
+    # ------------------------------------------------------------------ #
+    # 工具
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now()
+
+    @classmethod
+    def _iso(cls, dt: datetime | None = None) -> str:
+        return (dt or cls._now()).isoformat(timespec="seconds")
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        try:
+            return int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _remember_bot(self, event: AstrMessageEvent):
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            self.bot = bot
+
+    def _get_bot(self):
+        if self.bot is not None:
+            return self.bot
+        try:
+            for inst in self.context.platform_manager.get_insts():
+                bot = getattr(inst, "bot", None)
+                if bot is not None:
+                    self.bot = bot
+                    return bot
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _sender(self, event: AstrMessageEvent) -> str:
+        return str(event.get_sender_id() or "").strip()
+
+    async def _reply(self, event: AstrMessageEvent, text: str):
+        try:
+            await event.send(MessageChain([Plain(text)]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[星露谷匹配] 回复发送失败: %s", exc)
+
+    async def _send_private(
+        self,
+        qq: str,
+        text: str,
+        event: AstrMessageEvent | None = None,
+        group_id: str | int | None = None,
+    ) -> bool:
+        bot = self._get_bot()
+        if event is not None:
+            bot = getattr(event, "bot", None) or bot
+        if bot is None or not qq.isdigit():
+            logger.warning("[星露谷匹配] 无可用 bot，无法私聊 %s", qq)
+            return False
+        gid = None
+        if group_id is not None and str(group_id).isdigit():
+            gid = int(group_id)
+        elif event is not None:
+            event_gid = str(event.get_group_id() or "")
+            if event_gid.isdigit():
+                gid = int(event_gid)
+        # 优先用群临时会话，避免必须加好友
+        if gid is not None:
+            call = getattr(bot, "call_action", None)
+            if call is not None:
+                try:
+                    await call(
+                        "send_private_msg",
+                        user_id=int(qq),
+                        group_id=gid,
+                        message=text,
+                    )
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    logger.info(
+                        "[星露谷匹配] 临时会话 %s（群 %s）失败，尝试好友私聊: %s",
+                        qq,
+                        gid,
+                        exc,
+                    )
+        try:
+            await bot.send_private_msg(user_id=int(qq), message=text)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[星露谷匹配] 私聊 %s 失败: %s", qq, exc)
+            return False
+
+    async def _send_group(
+        self, group_id: str, text: str, event: AstrMessageEvent | None = None
+    ) -> bool:
+        bot = self._get_bot()
+        if event is not None:
+            bot = getattr(event, "bot", None) or bot
+        if bot is None or not str(group_id).isdigit():
+            return False
+        try:
+            await bot.send_group_msg(group_id=int(group_id), message=text)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[星露谷匹配] 群消息 %s 失败: %s", group_id, exc)
+            return False
+
+    async def _send_group_at(
+        self, group_id: str | int, qq: str, text: str
+    ) -> bool:
+        """群内 @ 某人发提醒（私聊失败时的兜底通道）。"""
+        bot = self._get_bot()
+        if bot is None or not str(group_id).isdigit() or not str(qq).isdigit():
+            return False
+        try:
+            await bot.send_group_msg(
+                group_id=int(group_id),
+                message=[At(qq=int(qq)), Plain(" " + text)],
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[星露谷匹配] 群内@提醒 %s（群 %s）失败: %s", qq, group_id, exc
+            )
+            return False
+
+    async def _notice(
+        self,
+        qq: str,
+        text: str,
+        group_id: str | int | None,
+        fallback: str,
+    ) -> bool:
+        """关键通知：私聊优先，失败则群内 @ 兜底（fallback 不得含隐私信息）。"""
+        ok = await self._send_private(qq, text, group_id=group_id)
+        if not ok and group_id and str(group_id).isdigit():
+            await self._send_group_at(group_id, qq, fallback)
+        return ok
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        qq = self._sender(event)
+        admins = self.config.get("admins", [])
+        if isinstance(admins, str):
+            admins = [x for x in re.split(r"[,，\s]+", admins) if x]
+        try:
+            global_admins = self.context.get_config().get("admins_id", []) or []
+            admins = list(admins) + list(global_admins)
+        except Exception:  # noqa: BLE001
+            pass
+        if qq in {str(x).strip() for x in admins}:
+            return True
+        try:
+            if event.is_admin():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return getattr(event, "role", "") == "admin"
+
+    @staticmethod
+    def _extract_at(event: AstrMessageEvent) -> str | None:
+        for seg in event.get_messages():
+            if isinstance(seg, At):
+                qq = str(getattr(seg, "qq", "")).strip()
+                if qq.isdigit():
+                    return qq
+        return None
+
+    # ------------------------------------------------------------------ #
+    # 报名状态机
+    # ------------------------------------------------------------------ #
+    @filter.command("p")
+    async def p(self, event: AstrMessageEvent):
+        await self._handle_p(event)
+
+    @filter.regex(r"^\s*/p(?:\s|$)")
+    async def p_slash(self, event: AstrMessageEvent):
+        event.is_wake = True
+        event.is_at_or_wake_command = True
+        await self._handle_p(event)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
+    async def p_watch(self, event: AstrMessageEvent):
+        text = event.get_message_str().strip()
+        if "p" in text.lower() or "帮助" in text:
+            logger.info("[星露谷匹配] watcher raw=%r", text)
+        if text in {"帮助", "help"}:
+            await self._cmd_help(event, "")
+            return
+        if re.match(r"^\s*(?:/p|sp|p)(?:\s|$)", text):
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+            await self._handle_p(event)
+
+    async def _handle_p(self, event: AstrMessageEvent):
+        if event.get_extra("stardew_p_handled"):
+            return
+        event.set_extra("stardew_p_handled", True)
+        self._remember_bot(event)
+        event.call_llm = False
+        raw = event.get_message_str().strip()
+        logger.debug(
+            "[星露谷匹配] 命令进入: raw=%r wake=%s private=%s",
+            raw,
+            getattr(event, "is_at_or_wake_command", None),
+            event.is_private_chat(),
+        )
+        if raw.startswith("/"):
+            raw = raw[1:]
+        if raw.startswith("sp"):
+            raw = raw[1:]
+        parts = raw.split(None, 1)
+        if not parts or parts[0].lower() != "p":
+            return
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        sub, _, arg = rest.partition(" ")
+        sub = sub.strip()
+        arg = arg.strip()
+
+        handlers = {
+            "报名": self._cmd_join,
+            "状态": self._cmd_status,
+            "房间": self._cmd_rooms,
+            "取消": self._cmd_cancel,
+            "确认": self._cmd_confirm,
+            "拒绝": self._cmd_reject,
+            "完成": self._cmd_done,
+            "举报": self._cmd_report,
+            "帮助": self._cmd_help,
+            "封禁": self._cmd_ban,
+            "解封": self._cmd_unban,
+            "统计": self._cmd_stats,
+            "解散": self._cmd_dissolve,
+            "队列": self._cmd_queue,
+        }
+        handler = handlers.get(sub)
+        if handler is None:
+            await self._cmd_help(event, "")
+            return
+        await handler(event, arg)
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
+    async def on_private_message(self, event: AstrMessageEvent):
+        qq = self._sender(event)
+        state = self.reg.get(qq)
+        if not state:
+            if qq not in self.reco:
+                return
+            text = event.get_message_str().strip()
+            if not text:
+                return
+            low = text.lower()
+            if low == "p" or low.startswith("p ") or low.startswith("/p"):
+                return
+            self._remember_bot(event)
+            event.call_llm = False
+            await self._reco_answer(event, qq, text)
+            return
+        text = event.get_message_str().strip()
+        if not text:
+            return
+        low = text.lower()
+        if low == "p" or low.startswith("p ") or low.startswith("/p"):
+            return
+        self._remember_bot(event)
+        event.call_llm = False
+        await self._registration_answer(event, qq, state, text)
+        self._reg_save()
+
+    async def _reco_answer(self, event: AstrMessageEvent, qq: str, text: str) -> bool:
+        """房间推荐交互：同意/换一个。返回是否消费了该消息。"""
+        st = self.reco.get(qq)
+        if st is None:
+            return False
+        low = text.strip().lower()
+        if low in {"1", "y", "yes", "好", "同意", "加入", "行", "好呀", "可以"}:
+            await self._accept_recommendation(event, qq)
+            return True
+        if low in {"2", "n", "no", "不", "换", "下一个", "不了", "算了"}:
+            await self._next_recommendation(event, qq)
+            return True
+        await self._reply(
+            event,
+            "请回复「1」加入推荐的房间，或「2」看看下一个；"
+            "不想换房可继续等待，发送 /p 取消 可退出当前房间。",
+        )
+        return True
+
+    @staticmethod
+    def _parse_pool(text: str) -> str | None:
+        return POOL_ALIASES.get(text.strip().lower())
+
+    @staticmethod
+    def _parse_modded(text: str) -> int | None:
+        t = text.strip().lower()
+        if t in {"1", "原版", "vanilla", "无模组", "无mod"}:
+            return 0
+        if t in {"2", "模组", "mod", "modded", "有模组"}:
+            return 1
+        return None
+
+    @staticmethod
+    def _parse_slots(text: str) -> list[str] | None:
+        tokens = [x for x in re.split(r"[,，、\s]+", text.strip()) if x]
+        result: list[str] = []
+        for token in tokens:
+            slot = SLOT_ALIASES.get(token.strip().lower())
+            if slot and slot not in result:
+                result.append(slot)
+        return result or None
+
+    @staticmethod
+    def _parse_target(text: str) -> int | None:
+        try:
+            value = int(text.strip())
+        except ValueError:
+            return None
+        return value if 2 <= value <= 4 else None
+
+    @staticmethod
+    def _parse_have(text: str, target: int) -> int | None:
+        try:
+            value = int(text.strip())
+        except ValueError:
+            return None
+        return value if 1 <= value < target else None
+
+    @staticmethod
+    def _parse_qq(text: str, fallback: str) -> str | None:
+        t = text.strip()
+        if t in {"默认", "default", "当前", "自己"}:
+            return fallback
+        if t.isdigit() and 5 <= len(t) <= 12:
+            return t
+        return None
+
+    @staticmethod
+    def _parse_steam(text: str) -> str:
+        t = text.strip()
+        if t in {"跳过", "skip", "无", "-"}:
+            return ""
+        return t[:64]
+
+    @staticmethod
+    def _pool_label(pool: str) -> str:
+        return POOLS.get(pool, pool)
+
+    @staticmethod
+    def _modded_label(modded: int) -> str:
+        return "模组" if int(modded) else "原版"
+
+    @staticmethod
+    def _slots_label(slots_json: str) -> str:
+        try:
+            slots = json.loads(slots_json)
+        except (TypeError, ValueError):
+            slots = []
+        return "、".join(SLOTS.get(s, s) for s in slots) or "未填"
+
+    def _match_summary(self, pool: str, modded: int, slots: str, size: int) -> str:
+        return (
+            f"{self._pool_label(pool)} / {self._modded_label(modded)} / "
+            f"{self._slots_label(slots)} / 目标{size}人"
+        )
+
+    @staticmethod
+    def _parse_gender(text: str) -> str | None:
+        return GENDER_ALIASES.get(text.strip().lower())
+
+    @staticmethod
+    def _parse_prefer(text: str) -> str | None:
+        return PREFER_ALIASES.get(text.strip().lower())
+
+    @staticmethod
+    def _gender_label(gender: str) -> str:
+        return GENDERS.get(gender, "保密")
+
+    @staticmethod
+    def _prefer_label(prefer: str) -> str:
+        return PREFERS.get(prefer, "不限")
+
+    def _summary_text(self, data: dict) -> str:
+        target = int(data.get("target", 0))
+        have = int(data.get("have", 0))
+        need = max(0, target - have)
+        return (
+            "请确认报名信息：\n"
+            f"{self._match_summary(data['pool'], data['modded'], json.dumps(data['slots']), target)}\n"
+            f"目标人数：{target} 人，我方 {have} 人，还需 {need} 人\n"
+            f"性别：{self._gender_label(data['gender'])}\n"
+            f"希望对方：{self._prefer_label(data['prefer_gender'])}\n"
+            f"联系 QQ：{data['contact_qq']}\n"
+            f"Steam：{data['contact_steam'] or '未填'}\n\n"
+            "回复“确认”提交，或“上一步”修改，或“取消”放弃。"
+        )
+
+    def _question_for(self, step: str, data: dict) -> str:
+        if step == "confirm":
+            return self._summary_text(data)
+        if step == "have":
+            max_have = max(1, int(data.get("target", 4)) - 1)
+            return Q_HAVE.format(max_have=max_have) + BACK_HINT
+        return STEP_QUESTIONS[step] + BACK_HINT
+
+    async def _go_back(self, event: AstrMessageEvent, state: dict):
+        step = state["step"]
+        if step not in STEPS:
+            return
+        idx = STEPS.index(step)
+        if idx == 0:
+            await self._reply(event, "已经是第一步了。")
+            return
+        prev = STEPS[idx - 1]
+        state["step"] = prev
+        field = STEP_FIELDS.get(prev)
+        if field:
+            state["data"].pop(field, None)
+        await self._reply(event, self._question_for(prev, state["data"]))
+
+    async def _registration_answer(
+        self, event: AstrMessageEvent, qq: str, state: dict, text: str
+    ):
+        text = text.strip()
+        if text in {"取消", "放弃", "退出", "0", "n", "no"}:
+            self.reg.pop(qq, None)
+            self._reg_save()
+            await self._reply(event, "已取消报名，发送 /p 报名 可随时重新开始。")
+            return
+        if text in {"上一步", "返回", "back", "b", "上一页"}:
+            await self._go_back(event, state)
+            return
+
+        step = state["step"]
+        data = state["data"]
+
+        if step == "pool":
+            value = self._parse_pool(text)
+            if value is None:
+                await self._reply(event, "无效平台，请回复 1-5。")
+                return
+            data["pool"] = value
+            state["step"] = "modded"
+            await self._reply(event, self._question_for("modded", data))
+            return
+
+        if step == "modded":
+            value = self._parse_modded(text)
+            if value is None:
+                await self._reply(event, "请回复 1（原版）或 2（模组）。")
+                return
+            data["modded"] = value
+            state["step"] = "slots"
+            await self._reply(event, self._question_for("slots", data))
+            return
+
+        if step == "slots":
+            value = self._parse_slots(text)
+            if value is None:
+                await self._reply(event, "请至少选择一个时段，例如：3,4")
+                return
+            data["slots"] = value
+            state["step"] = "target"
+            await self._reply(event, self._question_for("target", data))
+            return
+
+        if step == "target":
+            value = self._parse_target(text)
+            if value is None:
+                await self._reply(event, "目标人数只能是 2、3 或 4，请重新输入。")
+                return
+            data["target"] = value
+            state["step"] = "have"
+            await self._reply(event, self._question_for("have", data))
+            return
+
+        if step == "have":
+            value = self._parse_have(text, int(data["target"]))
+            if value is None:
+                await self._reply(
+                    event,
+                    f"我方人数需在 1 到 {int(data['target']) - 1} 之间，请重新输入。",
+                )
+                return
+            data["have"] = value
+            state["step"] = "gender"
+            await self._reply(event, self._question_for("gender", data))
+            return
+
+        if step == "gender":
+            value = self._parse_gender(text)
+            if value is None:
+                await self._reply(event, "请回复 1（男）、2（女）或 3（保密）。")
+                return
+            data["gender"] = value
+            state["step"] = "prefer_gender"
+            await self._reply(event, self._question_for("prefer_gender", data))
+            return
+
+        if step == "prefer_gender":
+            value = self._parse_prefer(text)
+            if value is None:
+                await self._reply(event, "请回复 1（男）、2（女）或 3（不限）。")
+                return
+            data["prefer_gender"] = value
+            state["step"] = "qq"
+            await self._reply(event, self._question_for("qq", data))
+            return
+
+        if step == "qq":
+            value = self._parse_qq(text, qq)
+            if value is None:
+                await self._reply(event, "QQ 号格式不对，请回复 5-12 位数字，或发送“默认”。")
+                return
+            data["contact_qq"] = value
+            state["step"] = "steam"
+            await self._reply(event, self._question_for("steam", data))
+            return
+
+        if step == "steam":
+            data["contact_steam"] = self._parse_steam(text)
+            state["step"] = "confirm"
+            await self._reply(event, self._summary_text(data))
+            return
+
+        if step == "confirm":
+            if text in {"确认", "确定", "提交", "1", "y", "yes"}:
+                await self._finish_registration(event, qq, state)
+            elif text in {"取消", "放弃", "0", "n", "no"}:
+                self.reg.pop(qq, None)
+                await self._reply(event, "已取消报名。")
+            else:
+                await self._reply(event, "请回复“确认”提交、“上一步”修改，或“取消”放弃。")
+
+    async def _cmd_join(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        if not qq:
+            return
+        if await self._is_banned(qq):
+            await self._reply(event, "你已被禁止报名，请联系管理员。")
+            return
+        cooldown_until = self.cooldowns.get(qq, 0)
+        if cooldown_until > time.time():
+            remain = int(cooldown_until - time.time())
+            await self._reply(event, f"你刚拒绝过匹配，请 {remain} 秒后再报名。")
+            return
+        if qq in self.reg:
+            await self._reply(event, "你正在报名中，请按私聊提示完成，或发送“取消”。")
+            return
+        if await self.rooms.active(qq):
+            await self._reply(event, "你已经在房间里，发送 /p 状态 查看。")
+            return
+        if await self._active_queue(qq):
+            await self._reply(event, "你已经在队列中，发送 /p 状态 查看。")
+            return
+        if await self._active_match(qq):
+            await self._reply(event, "你还有未完成的匹配，发送 /p 状态 查看。")
+            return
+
+        group_id = str(event.get_group_id() or "")
+        self.reg[qq] = {
+            "step": "pool",
+            "data": {},
+            "group_id": group_id,
+            "nickname": event.get_sender_name() or "",
+        }
+        self._reg_save()
+
+        if event.is_private_chat():
+            await self._reply(event, self._question_for("pool", {}))
+        else:
+            ok = await self._send_private(
+                qq,
+                self._question_for("pool", {}),
+                event,
+                group_id=group_id,
+            )
+            if ok:
+                await self._reply(
+                    event,
+                    "已通过群临时会话私聊你，请按提示完成报名；过程中随时可回复“上一步”修改。",
+                )
+            else:
+                self.reg.pop(qq, None)
+                self._reg_save()
+                bot_qq = event.get_self_id() or ""
+                hint = (
+                    f" 私聊/临时会话发送失败。请加机器人 {bot_qq} 为好友，"
+                    "备注“星露谷”会自动通过；"
+                    "或在群里点机器人头像发临时会话，然后发送 /p 报名。"
+                )
+                if event.is_private_chat():
+                    await self._reply(event, hint.strip())
+                else:
+                    await event.send(MessageChain([At(qq=qq), Plain(hint)]))
+
+    async def _finish_registration(
+        self, event: AstrMessageEvent, qq: str, state: dict
+    ):
+        data = state["data"]
+        if await self._is_banned(qq):
+            self.reg.pop(qq, None)
+            await self._reply(event, "你已被禁止报名。")
+            return
+        if await self.rooms.active(qq):
+            self.reg.pop(qq, None)
+            await self._reply(event, "你已经在房间里了，发送 /p 状态 查看。")
+            return
+        if "target" not in data or "have" not in data:
+            self.reg.pop(qq, None)
+            await self._reply(event, "报名信息不完整，请重新发送 /p 报名。")
+            return
+
+        now = self._now()
+        slots_json = json.dumps(data["slots"], ensure_ascii=False)
+        async with self._db() as db:
+            await db.execute(
+                """
+                INSERT INTO players
+                    (qq, nickname, pool, modded, time_slots, party_size, gender,
+                     prefer_gender, contact_qq, contact_steam, status,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'room', ?, ?)
+                ON CONFLICT(qq) DO UPDATE SET
+                    nickname=excluded.nickname,
+                    pool=excluded.pool, modded=excluded.modded,
+                    time_slots=excluded.time_slots, party_size=excluded.party_size,
+                    gender=excluded.gender, prefer_gender=excluded.prefer_gender,
+                    contact_qq=excluded.contact_qq, contact_steam=excluded.contact_steam,
+                    status='room', updated_at=excluded.updated_at
+                """,
+                (
+                    qq,
+                    state.get("nickname") or qq,
+                    data["pool"],
+                    data["modded"],
+                    slots_json,
+                    data["target"],
+                    data["gender"],
+                    data["prefer_gender"],
+                    data["contact_qq"],
+                    data["contact_steam"],
+                    self._iso(now),
+                    self._iso(now),
+                ),
+            )
+            await db.commit()
+
+        self.reg.pop(qq, None)
+        await self.rooms.join(
+            event,
+            qq,
+            data,
+            group_id=state.get("group_id", ""),
+            nickname=state.get("nickname") or qq,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 用户命令
+    # ------------------------------------------------------------------ #
+    async def _active_queue(self, qq: str) -> bool:
+        async with self._db() as db:
+            await db.execute(
+                """
+                UPDATE queue SET status='cancelled'
+                WHERE qq=? AND status='matched'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM matches m
+                    WHERE (m.player_a=queue.qq OR m.player_b=queue.qq)
+                      AND m.status IN ('pending','confirmed')
+                  )
+                """,
+                (qq,),
+            )
+            await db.commit()
+            row = await (
+                await db.execute(
+                    "SELECT id FROM queue WHERE qq=? AND status IN ('waiting','matched') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+        return row is not None
+
+    async def _active_match(self, qq: str) -> bool:
+        async with self._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT id FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status IN ('pending','confirmed') ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _human_minutes(mins: int) -> str:
+        mins = max(0, int(mins))
+        if mins >= 60:
+            return f"{mins // 60} 小时 {mins % 60} 分钟"
+        return f"{mins} 分钟"
+
+    async def _cmd_status(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        room_text = await self.rooms.status(qq)
+        if room_text:
+            await self._reply(event, room_text)
+            return
+        await self._active_queue(qq)
+        async with self._db() as db:
+            queue_row = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE qq=? AND status IN ('waiting','matched') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+            match_row = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status IN ('pending','confirmed') ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+
+        if match_row:
+            other = (
+                match_row["player_b"]
+                if match_row["player_a"] == qq
+                else match_row["player_a"]
+            )
+            state = "待确认" if match_row["status"] == "pending" else "已确认"
+            steam_line = ""
+            if match_row["status"] == "confirmed":
+                async with self._db() as db:
+                    other_row = await (
+                        await db.execute(
+                            "SELECT contact_steam FROM players WHERE qq=?", (other,)
+                        )
+                    ).fetchone()
+                other_steam = (other_row["contact_steam"] if other_row else "") or "未填"
+                if event.is_private_chat():
+                    steam_line = f"对方 Steam：{other_steam}\n"
+                else:
+                    steam_line = "对方 Steam：请私聊机器人发送 /p 状态 查看。\n"
+            await self._reply(
+                event,
+                f"当前匹配：#{match_row['id']}（{state}）\n"
+                f"对方 QQ：{other}\n"
+                f"平台：{self._match_summary(match_row['pool'], match_row['modded'], '[]', match_row['party_size'])}\n"
+                + steam_line
+                + (
+                    "发送 /p 完成 结束本次联机。"
+                    if match_row["status"] == "confirmed"
+                    else "在私聊回复 /p 确认 或 /p 拒绝。"
+                ),
+            )
+            return
+        if queue_row:
+            mins = int(self._wait_seconds(queue_row) // 60)
+            await self._reply(
+                event,
+                f"排队中：{self._match_summary(queue_row['pool'], queue_row['modded'], queue_row['time_slots'], queue_row['party_size'])}\n"
+                f"已排队：{self._human_minutes(mins)}\n"
+                "发送 /p 取消 可退出。",
+            )
+            return
+        await self._reply(event, "你当前没有排队或匹配记录。发送 /p 报名 开始。")
+
+    async def _cmd_cancel(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        room_text = await self.rooms.leave(qq)
+        if room_text:
+            await self._reply(event, room_text)
+            return
+        async with self._db() as db:
+            queue_row = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE qq=? AND status='waiting' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+            match_row = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status IN ('pending','confirmed') ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+
+            if match_row:
+                other = (
+                    match_row["player_b"]
+                    if match_row["player_a"] == qq
+                    else match_row["player_a"]
+                )
+                await db.execute(
+                    "UPDATE matches SET status='cancelled', closed_at=?, close_reason='cancelled' WHERE id=?",
+                    (self._iso(), match_row["id"]),
+                )
+                await self._requeue(db, other)
+                await self._close_queue(db, qq, "cancelled")
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                    (self._iso(), qq),
+                )
+                await db.commit()
+                await self._notice(
+                    other,
+                    "对方取消了匹配，你已重新进入队列。",
+                    (
+                        match_row["group_b"]
+                        if match_row["player_a"] == qq
+                        else match_row["group_a"]
+                    ),
+                    "你的星露谷匹配对象取消了本次匹配，你已重新排队。",
+                )
+                await self._reply(event, "已取消当前匹配。")
+                return
+
+            if queue_row:
+                await db.execute(
+                    "UPDATE queue SET status='cancelled' WHERE id=?", (queue_row["id"],)
+                )
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                    (self._iso(), qq),
+                )
+                await db.commit()
+                await self._reply(event, "已退出匹配队列。")
+                return
+
+        await self._reply(event, "你当前没有可取消的排队或匹配。")
+
+    async def _cmd_confirm(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        if await self.rooms.active(qq):
+            await self._reply(
+                event, "房间满员即匹配，不需要确认；发送 /p 状态 查看房间。"
+            )
+            return
+        async with self._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status='pending' ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+            if not row:
+                await self._reply(event, "没有待确认的匹配。")
+                return
+            is_a = row["player_a"] == qq
+            other = row["player_b"] if is_a else row["player_a"]
+            flag_col = "confirm_a" if is_a else "confirm_b"
+            if row[flag_col]:
+                await self._reply(event, "你已确认，等待对方确认。")
+                return
+            await db.execute(
+                f"UPDATE matches SET {flag_col}=1 WHERE id=?", (row["id"],)
+            )
+            await db.commit()
+            updated = await (
+                await db.execute("SELECT * FROM matches WHERE id=?", (row["id"],))
+            ).fetchone()
+
+        if updated["confirm_a"] and updated["confirm_b"]:
+            await self._complete_match(updated)
+            return
+        await self._reply(event, "已确认，等待对方确认（5 分钟内有效）。")
+        await self._notice(
+            other,
+            "对方已确认匹配，请尽快在私聊回复 /p 确认。",
+            row["group_b"] if is_a else row["group_a"],
+            "你的星露谷匹配对方已确认——请加机器人为好友后私聊回复 /p 确认。",
+        )
+
+    async def _cmd_reject(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        async with self._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status IN ('pending','confirmed') ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+            if not row:
+                await self._reply(event, "没有可拒绝的匹配。")
+                return
+            other = row["player_b"] if row["player_a"] == qq else row["player_a"]
+            await db.execute(
+                "UPDATE matches SET status='rejected', closed_at=?, close_reason='rejected' WHERE id=?",
+                (self._iso(), row["id"]),
+            )
+            await self._requeue(db, other)
+            await self._close_queue(db, qq, "cancelled")
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                (self._iso(), qq),
+            )
+            await db.commit()
+
+        cooldown = self._cfg_int("cooldown_sec", 600)
+        self.cooldowns[qq] = time.time() + cooldown
+        await self._reply(
+            event, f"已拒绝本次匹配，{max(1, cooldown // 60)} 分钟内不能再次匹配。"
+        )
+        await self._notice(
+            other,
+            "对方拒绝了匹配，你已重新进入队列。",
+            row["group_b"] if row["player_a"] == qq else row["group_a"],
+            "你的星露谷匹配被对方拒绝，你已重新排队。",
+        )
+
+    async def _cmd_done(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        room_text = await self.rooms.complete(qq)
+        if room_text:
+            await self._reply(event, room_text)
+            return
+        async with self._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE (player_a=? OR player_b=?) "
+                    "AND status IN ('confirmed','playing') ORDER BY id DESC LIMIT 1",
+                    (qq, qq),
+                )
+            ).fetchone()
+            if not row:
+                await self._reply(event, "没有进行中的匹配。")
+                return
+            other = row["player_b"] if row["player_a"] == qq else row["player_a"]
+            await db.execute(
+                "UPDATE matches SET status='completed', closed_at=?, close_reason='completed' WHERE id=?",
+                (self._iso(), row["id"]),
+            )
+            await self._close_queue(db, qq, "completed")
+            await self._close_queue(db, other, "completed")
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq IN (?,?)",
+                (self._iso(), qq, other),
+            )
+            await db.commit()
+        await self._reply(event, "已结束本次匹配，感谢使用。")
+        await self._notice(
+            other,
+            "对方已结束本次匹配，欢迎再次使用 /p 报名。",
+            row["group_b"] if row["player_a"] == qq else row["group_a"],
+            "你的星露谷匹配对方已结束本次联机，欢迎重新 /p 报名。",
+        )
+
+    async def _cmd_report(self, event: AstrMessageEvent, arg: str):
+        qq = self._sender(event)
+        report_until = self.cooldowns.get(f"rep:{qq}", 0)
+        if report_until > time.time():
+            remain = int(report_until - time.time())
+            await self._reply(event, f"举报发送太频繁，请 {remain} 秒后再试。")
+            return
+        target = self._extract_at(event)
+        reason = arg
+        if target:
+            reason = reason.replace(f"@{target}", "").strip()
+        if not target:
+            parts = arg.split(None, 1)
+            if parts and parts[0].isdigit():
+                target = parts[0]
+                reason = parts[1] if len(parts) > 1 else ""
+        if not target or not target.isdigit():
+            await self._reply(event, "用法：/p 举报 @某人 原因")
+            return
+        async with self._db() as db:
+            await db.execute(
+                "INSERT INTO reports (reporter, target, reason, created_at) VALUES (?,?,?,?)",
+                (qq, target, reason[:200], self._iso()),
+            )
+            await db.commit()
+        self.cooldowns[f"rep:{qq}"] = time.time() + 600
+        await self._reply(event, "举报已提交，管理员会处理。")
+        admins = self.config.get("admins", [])
+        if isinstance(admins, str):
+            admins = [x for x in re.split(r"[,，\s]+", admins) if x]
+        for admin in admins:
+            await self._send_private(
+                str(admin), f"收到举报：{qq} 举报 {target}\n原因：{reason[:200]}"
+            )
+
+    async def _cmd_help(self, event: AstrMessageEvent, arg: str):
+        await self._reply(
+            event,
+            "星露谷联机匹配\n"
+            "/p 报名 - 报名（私聊完成问卷，回复“取消”可退出）\n"
+            "/p 状态 - 查看当前房间/匹配\n"
+            "/p 房间 - 查看现有等待中的房间\n"
+            "/p 确认 - 确认匹配\n"
+            "/p 拒绝 - 拒绝匹配\n"
+            "/p 取消 - 退出房间/队列\n"
+            "/p 完成 - 结束本次联机\n"
+            "/p 举报 @某人 原因 - 举报\n"
+            "/p 帮助 - 本说明\n"
+            "房间满员会自动匹配，不需要确认；有人加入会私聊通知。\n"
+            "管理员：/p 封禁 /p 解封 /p 统计 /p 解散 /p 队列",
+        )
+
+    # ------------------------------------------------------------------ #
+    # 管理员命令
+    # ------------------------------------------------------------------ #
+    async def _cmd_ban(self, event: AstrMessageEvent, arg: str):
+        if not self._is_admin(event):
+            await self._reply(event, "只有管理员可以执行该命令。")
+            return
+        target = self._extract_at(event)
+        rest = arg
+        if target:
+            rest = rest.replace(f"@{target}", "").strip()
+        if not target:
+            parts = rest.split(None, 1)
+            if parts and parts[0].isdigit():
+                target = parts[0]
+                rest = parts[1] if len(parts) > 1 else ""
+        if not target or not target.isdigit():
+            await self._reply(event, "用法：/p 封禁 @某人 [7d|24h|永久] [原因]")
+            return
+        duration, reason = self._parse_ban_args(rest)
+        until = ""
+        if duration is not None:
+            until = self._iso(self._now() + timedelta(seconds=duration))
+        async with self._db() as db:
+            await db.execute(
+                """
+                INSERT INTO bans (qq, reason, until, created_at, created_by)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(qq) DO UPDATE SET
+                    reason=excluded.reason, until=excluded.until,
+                    created_at=excluded.created_at, created_by=excluded.created_by
+                """,
+                (target, reason, until, self._iso(), self._sender(event)),
+            )
+            await db.execute(
+                "UPDATE queue SET status='cancelled' WHERE qq=? AND status='waiting'",
+                (target,),
+            )
+            await db.execute(
+                "UPDATE players SET status='banned', updated_at=? WHERE qq=?",
+                (self._iso(), target),
+            )
+            await db.commit()
+        await self._reply(
+            event,
+            f"已封禁 {target}" + (f"，到期：{until}" if until else "（永久）"),
+        )
+
+    @staticmethod
+    def _parse_ban_args(text: str) -> tuple[int | None, str]:
+        text = text.strip()
+        if not text:
+            return None, ""
+        parts = text.split(None, 1)
+        token = parts[0].lower()
+        reason = parts[1] if len(parts) > 1 else ""
+        if token in {"永久", "permanent", "forever", "0"}:
+            return None, reason
+        match = re.fullmatch(r"(\d+)([smhdw])", token)
+        if not match:
+            return None, text
+        value = int(match.group(1))
+        unit = match.group(2)
+        seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+        return seconds, reason
+
+    async def _cmd_unban(self, event: AstrMessageEvent, arg: str):
+        if not self._is_admin(event):
+            await self._reply(event, "只有管理员可以执行该命令。")
+            return
+        target = self._extract_at(event) or arg.strip()
+        if not target.isdigit():
+            await self._reply(event, "用法：/p 解封 @某人")
+            return
+        async with self._db() as db:
+            await db.execute("DELETE FROM bans WHERE qq=?", (target,))
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                (self._iso(), target),
+            )
+            await db.commit()
+        await self._reply(event, f"已解封 {target}")
+
+    async def _cmd_stats(self, event: AstrMessageEvent, arg: str):
+        if not self._is_admin(event):
+            await self._reply(event, "只有管理员可以执行该命令。")
+            return
+        today = self._now().strftime("%Y-%m-%d")
+        async with self._db() as db:
+            players_today = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM players WHERE created_at LIKE ?",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            matches_today = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM matches WHERE created_at LIKE ?",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            success_today = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM matches WHERE created_at LIKE ? "
+                        "AND status IN ('confirmed','playing','completed')",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            waiting = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM queue WHERE status='waiting'"
+                    )
+                ).fetchone()
+            )[0]
+            groups = (
+                await (
+                    await db.execute(
+                        "SELECT count(DISTINCT group_id) FROM queue "
+                        "WHERE status='waiting' AND group_id != ''"
+                    )
+                ).fetchone()
+            )[0]
+        rate = f"{success_today * 100 // matches_today}%" if matches_today else "0%"
+        await self._reply(
+            event,
+            f"今日统计（{today}）\n"
+            f"报名：{players_today}\n"
+            f"匹配：{matches_today}，成功：{success_today}（{rate}）\n"
+            f"排队中：{waiting}\n"
+            f"活跃群：{groups}",
+        )
+
+    async def _cmd_queue(self, event: AstrMessageEvent, arg: str):
+        if not self._is_admin(event):
+            await self._reply(event, "只有管理员可以执行该命令。")
+            return
+        rooms = await self.rooms.stats()
+        if not rooms:
+            await self._reply(event, "当前没有开放房间。")
+            return
+        lines = [
+            f"#{r['id']} {r['pool']} / {r['modded']} / {r['current']}-{r['target']} 人"
+            for r in rooms
+        ]
+        await self._reply(event, "当前开放房间：\n" + "\n".join(lines))
+
+    async def _cmd_dissolve(self, event: AstrMessageEvent, arg: str):
+        if not self._is_admin(event):
+            await self._reply(event, "只有管理员可以执行该命令。")
+            return
+        if not arg.isdigit():
+            await self._reply(event, "用法：/p 解散 <匹配ID>")
+            return
+        match_id = int(arg)
+        async with self._db() as db:
+            row = await (
+                await db.execute("SELECT * FROM matches WHERE id=?", (match_id,))
+            ).fetchone()
+            if not row:
+                await self._reply(event, "匹配不存在。")
+                return
+            if row["status"] not in ("pending", "confirmed", "playing"):
+                await self._reply(event, "该匹配已经结束。")
+                return
+            if row["room_id"]:
+                ok, message = await self.rooms.dissolve(row["room_id"])
+                await self._reply(event, message)
+                return
+            await db.execute(
+                "UPDATE matches SET status='cancelled', closed_at=?, close_reason='dissolved' WHERE id=?",
+                (self._iso(), match_id),
+            )
+            await self._requeue(db, row["player_a"])
+            await self._requeue(db, row["player_b"])
+            await db.commit()
+        await self._reply(event, f"已解散匹配 #{match_id}，双方重新排队。")
+
+    # ------------------------------------------------------------------ #
+    # WebUI 统计页
+    # ------------------------------------------------------------------ #
+    async def _page_stats(self):
+        await self._backfill_nicknames()
+        today = self._now().strftime("%Y-%m-%d")
+        async with self._db() as db:
+            signups = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM players WHERE created_at LIKE ?",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            matches = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM matches WHERE created_at LIKE ?",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            success = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM matches WHERE created_at LIKE ? "
+                        "AND status IN ('confirmed','playing','completed')",
+                        (f"{today}%",),
+                    )
+                ).fetchone()
+            )[0]
+            waiting = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM room_members rm "
+                        "JOIN rooms r ON r.id=rm.room_id "
+                        "WHERE rm.active=1 AND r.status='open'"
+                    )
+                ).fetchone()
+            )[0]
+            active_groups = (
+                await (
+                    await db.execute(
+                        "SELECT count(DISTINCT rm.group_id) FROM room_members rm "
+                        "JOIN rooms r ON r.id=rm.room_id "
+                        "WHERE rm.active=1 AND r.status='open' AND rm.group_id != ''"
+                    )
+                ).fetchone()
+            )[0]
+            pool_rows = await (
+                await db.execute(
+                    "SELECT r.pool, count(*) AS n FROM room_members rm "
+                    "JOIN rooms r ON r.id=rm.room_id "
+                    "WHERE rm.active=1 AND r.status='open' GROUP BY r.pool"
+                )
+            ).fetchall()
+            hourly_rows = await (
+                await db.execute(
+                    "SELECT substr(created_at, 12, 2) AS hour, count(*) AS n "
+                    "FROM matches WHERE created_at LIKE ? GROUP BY hour",
+                    (f"{today}%",),
+                )
+            ).fetchall()
+            recent_rows = await (
+                await db.execute(
+                    "SELECT m.id, m.room_id, m.player_a, m.player_b, m.pool, m.modded, "
+                    "m.party_size, m.status, m.forced, m.created_at, "
+                    "COALESCE(pa.nickname, '') AS name_a, "
+                    "COALESCE(pb.nickname, '') AS name_b "
+                    "FROM matches m "
+                    "LEFT JOIN players pa ON pa.qq = m.player_a "
+                    "LEFT JOIN players pb ON pb.qq = m.player_b "
+                    "ORDER BY m.id DESC LIMIT 50"
+                )
+            ).fetchall()
+            reports_open = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM reports WHERE status='open'"
+                    )
+                ).fetchone()
+            )[0]
+            bans = (
+                await (
+                    await db.execute(
+                        "SELECT count(*) FROM bans WHERE until='' OR until > ?",
+                        (self._iso(),),
+                    )
+                ).fetchone()
+            )[0]
+            queue_rows = await (
+                await db.execute(
+                    "SELECT qq, nickname, pool, modded, party_size, time_slots, gender, "
+                    "prefer_gender, group_id, enqueued_at FROM queue "
+                    "WHERE status='waiting' ORDER BY enqueued_at ASC"
+                )
+            ).fetchall()
+            ban_rows = await (
+                await db.execute(
+                    "SELECT qq, reason, until, created_at FROM bans "
+                    "WHERE until='' OR until > ? ORDER BY created_at DESC",
+                    (self._iso(),),
+                )
+            ).fetchall()
+            report_rows = await (
+                await db.execute(
+                    "SELECT id, reporter, target, reason, created_at FROM reports "
+                    "WHERE status='open' ORDER BY id DESC LIMIT 20"
+                )
+            ).fetchall()
+
+        pool_counts = {row["pool"]: row["n"] for row in pool_rows}
+        pools = [
+            {"pool": key, "label": label, "count": pool_counts.get(key, 0)}
+            for key, label in POOLS.items()
+        ]
+        hourly_map = {row["hour"]: row["n"] for row in hourly_rows}
+        hourly = [
+            {"hour": f"{h:02d}", "count": hourly_map.get(f"{h:02d}", 0)}
+            for h in range(24)
+        ]
+        recent = []
+        for row in recent_rows:
+            participants = []
+            if row["room_id"]:
+                async with self._db() as db:
+                    members = await (
+                        await db.execute(
+                            "SELECT qq, nickname, have FROM room_members "
+                            "WHERE room_id=? ORDER BY id ASC",
+                            (row["room_id"],),
+                        )
+                    ).fetchall()
+                participants = [
+                    {
+                        "qq": m["qq"],
+                        "nickname": m["nickname"] or m["qq"],
+                        "have": m["have"],
+                    }
+                    for m in members
+                ]
+            else:
+                participants = [
+                    {
+                        "qq": row["player_a"],
+                        "nickname": row["name_a"] or row["player_a"],
+                        "have": 0,
+                    },
+                    {
+                        "qq": row["player_b"],
+                        "nickname": row["name_b"] or row["player_b"],
+                        "have": 0,
+                    },
+                ]
+            recent.append(
+                {
+                    "id": row["id"],
+                    "room_id": row["room_id"],
+                    "player_a": row["player_a"],
+                    "player_b": row["player_b"],
+                    "player_a_name": row["name_a"] or row["player_a"],
+                    "player_b_name": row["name_b"] or row["player_b"],
+                    "pool": self._pool_label(row["pool"]),
+                    "modded": self._modded_label(row["modded"]),
+                    "party_size": row["party_size"],
+                    "status": row["status"],
+                    "forced": bool(row["forced"]),
+                    "participants": participants,
+                    "created_at": row["created_at"],
+                }
+            )
+        rooms_list = await self.rooms.stats()
+        now = self._now()
+        queue_list = []
+        for row in queue_rows:
+            try:
+                wait_seconds = max(
+                    0,
+                    int(
+                        (
+                            now - datetime.fromisoformat(row["enqueued_at"])
+                        ).total_seconds()
+                    ),
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 0
+            queue_list.append(
+                {
+                    "qq": row["qq"],
+                    "nickname": row["nickname"] or row["qq"],
+                    "pool": self._pool_label(row["pool"]),
+                    "modded": self._modded_label(row["modded"]),
+                    "party_size": row["party_size"],
+                    "slots": self._slots_label(row["time_slots"]),
+                    "gender": self._gender_label(row["gender"]),
+                    "prefer_gender": self._prefer_label(row["prefer_gender"]),
+                    "wait_seconds": wait_seconds,
+                }
+            )
+        ban_list = [
+            {
+                "qq": row["qq"],
+                "reason": row["reason"] or "",
+                "until": row["until"] or "永久",
+                "created_at": row["created_at"],
+            }
+            for row in ban_rows
+        ]
+        report_list = [
+            {
+                "id": row["id"],
+                "reporter": row["reporter"],
+                "target": row["target"],
+                "reason": row["reason"] or "",
+                "created_at": row["created_at"],
+            }
+            for row in report_rows
+        ]
+        return {
+            "ok": True,
+            "generated_at": self._iso(),
+            "today": {
+                "date": today,
+                "signups": signups,
+                "matches": matches,
+                "success": success,
+                "rate": round(success * 100 / matches, 1) if matches else 0,
+                "waiting": waiting,
+                "active_groups": active_groups,
+                "reports_open": reports_open,
+                "bans": bans,
+            },
+            "pools": pools,
+            "hourly": hourly,
+            "recent": recent,
+            "rooms": rooms_list,
+            "queue": queue_list,
+            "bans": ban_list,
+            "reports": report_list,
+            "admin": True,
+        }
+
+    async def _backfill_nicknames(self):
+        bot = self._get_bot()
+        if bot is None:
+            return
+        call = getattr(bot, "call_action", None)
+        if call is None:
+            api = getattr(bot, "api", None)
+            call = getattr(api, "call_action", None)
+        if call is None:
+            return
+        async with self._db() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT qq, group_id FROM queue "
+                    "WHERE (nickname IS NULL OR nickname='') AND group_id != '' "
+                    "ORDER BY id DESC LIMIT 5"
+                )
+            ).fetchall()
+        for row in rows:
+            try:
+                info = await asyncio.wait_for(
+                    call(
+                        action="get_group_member_info",
+                        group_id=int(row["group_id"]),
+                        user_id=int(row["qq"]),
+                        no_cache=False,
+                    ),
+                    timeout=3,
+                )
+                name = str(
+                    (info or {}).get("card") or (info or {}).get("nickname") or ""
+                ).strip()
+                if not name:
+                    continue
+                async with self._db() as db:
+                    await db.execute(
+                        "UPDATE queue SET nickname=? WHERE qq=?", (name, row["qq"])
+                    )
+                    await db.execute(
+                        "UPDATE players SET nickname=? WHERE qq=?", (name, row["qq"])
+                    )
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                continue
+
+    async def _page_admin(self):
+        body: dict = {}
+        try:
+            from astrbot.api.web import request as plugin_request
+
+            payload = await plugin_request.json(default={})
+            if isinstance(payload, dict):
+                body = payload
+        except Exception:  # noqa: BLE001
+            logger.exception("[星露谷匹配] 读取管理请求失败")
+            return {"ok": False, "message": "无法读取请求体"}
+
+        def as_int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        action = str(body.get("action") or "").strip()
+        try:
+            if action == "scan":
+                expired = await self.rooms.expire()
+                return {
+                    "ok": True,
+                    "message": (
+                        f"已检查房间，清理 {expired} 个过期房间"
+                        if expired
+                        else "已检查房间，没有过期房间"
+                    ),
+                }
+            if action == "force_fill":
+                ok, message = await self.rooms.force_fill(
+                    as_int(body.get("room_id"), 0)
+                )
+                return {"ok": ok, "message": message}
+            if action == "dissolve_room":
+                ok, message = await self.rooms.dissolve(
+                    as_int(body.get("room_id"), 0)
+                )
+                return {"ok": ok, "message": message}
+            if action == "match":
+                return await self._admin_manual_match(
+                    str(body.get("qq_a") or ""), str(body.get("qq_b") or "")
+                )
+            if action == "ban":
+                return await self._admin_ban(
+                    str(body.get("qq") or ""),
+                    as_int(body.get("seconds"), 0),
+                    str(body.get("reason") or "")[:200],
+                )
+            if action == "unban":
+                return await self._admin_unban(str(body.get("qq") or ""))
+            if action == "kick":
+                return await self._admin_kick(str(body.get("qq") or ""))
+            if action == "dissolve":
+                return await self._admin_dissolve(as_int(body.get("match_id"), 0))
+            if action == "resolve_report":
+                return await self._admin_resolve_report(
+                    as_int(body.get("report_id"), 0)
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[星露谷匹配] 管理操作失败: %s", action)
+            return {"ok": False, "message": f"操作失败：{exc}"}
+        return {"ok": False, "message": "未知操作"}
+
+    async def _admin_manual_match(self, qq_a: str, qq_b: str):
+        qq_a, qq_b = qq_a.strip(), qq_b.strip()
+        if not (qq_a.isdigit() and qq_b.isdigit()) or qq_a == qq_b:
+            return {"ok": False, "message": "请选择两个不同的排队用户"}
+        async with self._db() as db:
+            a = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE qq=? AND status='waiting' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (qq_a,),
+                )
+            ).fetchone()
+            b = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE qq=? AND status='waiting' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (qq_b,),
+                )
+            ).fetchone()
+            if not a or not b:
+                return {"ok": False, "message": "用户不在排队中"}
+            await self._create_match(db, a, b, forced=True)
+        return {
+            "ok": True,
+            "message": f"已强制撮合 {qq_a} 与 {qq_b}（已忽略所有匹配条件）",
+        }
+
+    async def _admin_ban(self, qq: str, seconds: int, reason: str):
+        if not qq.isdigit():
+            return {"ok": False, "message": "QQ 格式不正确"}
+        until = (
+            self._iso(self._now() + timedelta(seconds=seconds)) if seconds > 0 else ""
+        )
+        await self.rooms.kick_qq(qq)
+        async with self._db() as db:
+            await db.execute(
+                """
+                INSERT INTO bans (qq, reason, until, created_at, created_by)
+                VALUES (?,?,?,?,'dashboard')
+                ON CONFLICT(qq) DO UPDATE SET
+                    reason=excluded.reason, until=excluded.until,
+                    created_at=excluded.created_at, created_by=excluded.created_by
+                """,
+                (qq, reason, until, self._iso()),
+            )
+            await db.execute(
+                "UPDATE queue SET status='cancelled' WHERE qq=? AND status='waiting'",
+                (qq,),
+            )
+            await db.execute(
+                "UPDATE players SET status='banned', updated_at=? WHERE qq=?",
+                (self._iso(), qq),
+            )
+            await db.commit()
+        return {
+            "ok": True,
+            "message": f"已封禁 {qq}" + (f"，到期 {until}" if until else "（永久）"),
+        }
+
+    async def _admin_unban(self, qq: str):
+        if not qq.isdigit():
+            return {"ok": False, "message": "QQ 格式不正确"}
+        async with self._db() as db:
+            await db.execute("DELETE FROM bans WHERE qq=?", (qq,))
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                (self._iso(), qq),
+            )
+            await db.commit()
+        return {"ok": True, "message": f"已解封 {qq}"}
+
+    async def _admin_kick(self, qq: str):
+        if not qq.isdigit():
+            return {"ok": False, "message": "QQ 格式不正确"}
+        await self.rooms.kick_qq(qq)
+        async with self._db() as db:
+            await self._close_queue(db, qq, "cancelled")
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                (self._iso(), qq),
+            )
+            await db.commit()
+        return {"ok": True, "message": f"已将 {qq} 移出房间/队列"}
+
+    async def _admin_dissolve(self, match_id: int):
+        if match_id <= 0:
+            return {"ok": False, "message": "匹配 ID 不正确"}
+        async with self._db() as db:
+            row = await (
+                await db.execute("SELECT * FROM matches WHERE id=?", (match_id,))
+            ).fetchone()
+            if not row:
+                return {"ok": False, "message": "匹配不存在"}
+            if row["status"] not in ("pending", "confirmed", "playing"):
+                return {"ok": False, "message": "该匹配已经结束"}
+            await db.execute(
+                "UPDATE matches SET status='cancelled', closed_at=?, close_reason='dissolved' WHERE id=?",
+                (self._iso(), match_id),
+            )
+            await self._requeue(db, row["player_a"])
+            await self._requeue(db, row["player_b"])
+            await db.commit()
+        return {"ok": True, "message": f"已解散匹配 #{match_id}，双方重新排队"}
+
+    async def _admin_resolve_report(self, report_id: int):
+        if report_id <= 0:
+            return {"ok": False, "message": "举报 ID 不正确"}
+        async with self._db() as db:
+            await db.execute(
+                "UPDATE reports SET status='resolved' WHERE id=?", (report_id,)
+            )
+            await db.commit()
+        return {"ok": True, "message": f"举报 #{report_id} 已标记处理"}
+
+    # ------------------------------------------------------------------ #
+    # 匹配 worker
+    # ------------------------------------------------------------------ #
+    async def _match_loop(self):
+        while self._running:
+            try:
+                async with self._lock:
+                    await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("[星露谷匹配] 匹配循环异常")
+            await asyncio.sleep(max(5, self._cfg_int("match_interval_sec", 10)))
+
+    async def _tick(self):
+        await self._expire_queues()
+        await self._expire_matches()
+        await self.rooms.expire()
+        await self.rooms.warn_expiring()
+        await self._match_waiting()
+        await self._check_recommendations()
+
+    # ------------------------------------------------------------------ #
+    # 房间推荐（等待 >1h → 推荐条件相近房间；隐私：只展示组队信息）
+    # ------------------------------------------------------------------ #
+    async def _check_recommendations(self):
+        now = self._now()
+        cutoff = (now - timedelta(hours=1)).isoformat()
+        async with self._db() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT rm.qq, rm.group_id FROM room_members rm "
+                    "JOIN rooms r ON r.id = rm.room_id "
+                    "WHERE rm.active=1 AND r.status='open' AND rm.joined_at <= ?",
+                    (cutoff,),
+                )
+            ).fetchall()
+        for row in rows:
+            qq = row["qq"]
+            if qq in self.reco or qq in self.reg:
+                continue
+            if self.cooldowns.get(f"reco:{qq}", 0) > time.time():
+                continue
+            my = await self._my_member_row(qq)
+            if my is None or my["joined_at"] > cutoff:
+                continue
+            candidates = await self._room_candidates(my, exclude_ids={my["room_id"]})
+            if not candidates:
+                continue
+            self.reco[qq] = {
+                "candidates": candidates,
+                "rejected": [],
+                "current": None,
+                "group_id": row["group_id"] or "",
+            }
+            if not await self._show_recommendation(qq):
+                # 推送失败（bot 不可用或私聊失败且无群兜底）：撤销，下轮重试
+                self.reco.pop(qq, None)
+                fails = self.cooldowns.get(f"reco_fail:{qq}", 0) + 1
+                self.cooldowns[f"reco_fail:{qq}"] = fails
+                if fails >= 6:
+                    self.cooldowns[f"reco:{qq}"] = time.time() + 600
+                    self.cooldowns.pop(f"reco_fail:{qq}", None)
+
+    async def _my_member_row(self, qq: str):
+        async with self._db() as db:
+            return await (
+                await db.execute(
+                    "SELECT rm.*, r.pool AS pool, r.modded AS modded, "
+                    "r.time_slots AS time_slots "
+                    "FROM room_members rm "
+                    "JOIN rooms r ON r.id = rm.room_id "
+                    "WHERE rm.qq=? AND rm.active=1 AND r.status IN ('open','full') "
+                    "ORDER BY rm.id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+
+    async def _room_candidates(self, my, exclude_ids: set[int]) -> list[dict]:
+        """同平台、性别兼容、人数可容纳的 open 房间，按相近度降序。
+
+        相近度 = 模组一致(+10) + 时段交集(0-5) + 空位余量。不含任何联系方式。
+        """
+        now = self._now()
+        async with self._db() as db:
+            rooms = await (
+                await db.execute(
+                    "SELECT * FROM rooms WHERE status='open' AND pool=? "
+                    "AND expires_at > ?",
+                    (my["pool"], self._iso()),
+                )
+            ).fetchall()
+            try:
+                my_slots = set(json.loads(my["time_slots"]))
+            except (TypeError, ValueError):
+                my_slots = set()
+            scored: list[dict] = []
+            for room in rooms:
+                if room["id"] in exclude_ids:
+                    continue
+                members = await self.rooms._members(db, room["id"])
+                total = sum(m["have"] for m in members)
+                if total + my["have"] > room["target"]:
+                    continue
+                if not all(
+                    self._gender_ok(my["prefer_gender"], m["gender"])
+                    and self._gender_ok(m["prefer_gender"], my["gender"])
+                    for m in members
+                ):
+                    continue
+                try:
+                    room_slots = set(json.loads(room["time_slots"]))
+                except (TypeError, ValueError):
+                    room_slots = set()
+                score = (
+                    (10 if room["modded"] == my["modded"] else 0)
+                    + min(5, len(my_slots & room_slots))
+                    + 1
+                )
+                try:
+                    waited = int(
+                        (now - datetime.fromisoformat(room["created_at"])).total_seconds()
+                        // 60
+                    )
+                except (TypeError, ValueError):
+                    waited = 0
+                scored.append(
+                    {
+                        "room_id": room["id"],
+                        "pool": room["pool"],
+                        "modded": room["modded"],
+                        "time_slots": room["time_slots"],
+                        "target": room["target"],
+                        "total": total,
+                        "waited_min": waited,
+                        "score": score,
+                    }
+                )
+            scored.sort(key=lambda x: -x["score"])
+            return scored
+
+    async def _show_recommendation(self, qq: str) -> bool:
+        st = self.reco.get(qq)
+        if not st or not st["candidates"]:
+            return False
+        cand = st["candidates"][0]
+        st["current"] = cand["room_id"]
+        text = (
+            "⏰ 你所在的房间等待较久，为你找到一个条件相近的房间，可提前汇合：\n"
+            f"🏠 房间 #{cand['room_id']}（{self._pool_label(cand['pool'])} / "
+            f"{self._modded_label(cand['modded'])}）\n"
+            f"时段：{self._slots_label(cand['time_slots'])}\n"
+            f"目标 {cand['target']} 人，当前 {cand['total']} 人，"
+            f"该房已等 {self._human_minutes(cand['waited_min'])}\n"
+            "回复「1」立即加入；回复「2」看下一个。\n"
+            "（仅展示组队信息，不会透露任何成员联系方式）"
+        )
+        return await self._notice(
+            qq,
+            text,
+            st.get("group_id"),
+            "你有一条星露谷房间推荐——请加机器人为好友后私聊查看。",
+        )
+
+    async def _accept_recommendation(self, event: AstrMessageEvent, qq: str):
+        st = self.reco.get(qq)
+        if not st or not st.get("current"):
+            return
+        rid = st["current"]
+        my = await self._my_member_row(qq)
+        if my is None:
+            self.reco.pop(qq, None)
+            await self._reply(event, "你所在的房间状态已变化，发送 /p 状态 查看。")
+            return
+        if my["room_id"] == rid:
+            self.reco.pop(qq, None)
+            return
+        try:
+            slots = json.loads(my["time_slots"])
+        except (TypeError, ValueError):
+            slots = []
+        data = {
+            "pool": my["pool"],
+            "modded": my["modded"],
+            "slots": slots,
+            "have": my["have"],
+            "gender": my["gender"],
+            "prefer_gender": my["prefer_gender"],
+            "contact_qq": my["contact_qq"],
+            "contact_steam": my["contact_steam"] or "",
+        }
+        ok, msg = await self.rooms.join_specific(
+            qq,
+            data,
+            rid,
+            group_id=st.get("group_id", ""),
+            nickname=my["nickname"] or "",
+        )
+        if ok:
+            await self.rooms.detach_member(my["room_id"], qq)
+            self.reco.pop(qq, None)
+            await self._reply(event, f"✅ 已加入房间 #{rid}，原房间已退出，祝联机愉快！")
+            return
+        st["rejected"].append(rid)
+        st["candidates"] = [c for c in st["candidates"] if c["room_id"] != rid]
+        if st["candidates"]:
+            await self._reply(event, f"{msg}为你换下一个：")
+            await self._show_recommendation(qq)
+        else:
+            self.reco.pop(qq, None)
+            self.cooldowns[f"reco:{qq}"] = time.time() + 1800
+            await self._reply(event, f"{msg}暂时没有更多推荐，你将继续在原房间等待。")
+
+    async def _next_recommendation(self, event: AstrMessageEvent, qq: str):
+        st = self.reco.get(qq)
+        if not st:
+            return
+        if st.get("current"):
+            st["rejected"].append(st["current"])
+        dropped = set(st["rejected"])
+        st["candidates"] = [c for c in st["candidates"] if c["room_id"] not in dropped]
+        if st["candidates"]:
+            await self._show_recommendation(qq)
+        else:
+            self.reco.pop(qq, None)
+            self.cooldowns[f"reco:{qq}"] = time.time() + 1800
+            await self._reply(
+                event,
+                "好的，暂时没有更多相近房间，你将继续在原房间等待；"
+                "30 分钟内不会再向你推荐。",
+            )
+
+    async def _cmd_rooms(self, event: AstrMessageEvent, arg: str):
+        rooms = await self.rooms.list_open_rooms(limit=10)
+        if not rooms:
+            await self._reply(event, "当前没有等待中的房间，发送 /p 报名 创建第一个。")
+            return
+        lines = [f"🏠 当前等待中的房间（{len(rooms)} 个，不展示成员联系方式）："]
+        for i, r in enumerate(rooms, 1):
+            try:
+                created = datetime.fromisoformat(r["created_at"])
+                waited = int((self._now() - created).total_seconds() // 60)
+            except (TypeError, ValueError):
+                waited = 0
+            lines.append(
+                f"{i}. #{r['id']} {self._pool_label(r['pool'])}/"
+                f"{self._modded_label(r['modded'])} | 时段："
+                f"{self._slots_label(r['time_slots'])} | {r['total']}/{r['target']} 人"
+                f" | 已等 {self._human_minutes(waited)}"
+            )
+        lines.append("发送 /p 报名 参加匹配；等待超过 1 小时还会收到系统推荐。")
+        await self._reply(event, "\n".join(lines))
+
+    async def _expire_queues(self):
+        now = self._iso()
+        async with self._db() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE status='waiting' AND expires_at <= ?", (now,)
+                )
+            ).fetchall()
+            for row in rows:
+                await db.execute(
+                    "UPDATE queue SET status='expired' WHERE id=?", (row["id"],)
+                )
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq=? AND status='queued'",
+                    (now, row["qq"]),
+                )
+            if rows:
+                await db.commit()
+                for row in rows:
+                    await self._notice(
+                        row["qq"],
+                        "你的匹配排队已超时，已自动退出。发送 /p 报名 可重新排队。",
+                        group_id=row["group_id"],
+                        fallback="你的星露谷匹配排队已超时自动退出——"
+                        "请加机器人为好友后发送 /p 报名 重新排队。",
+                    )
+
+    async def _expire_matches(self):
+        now = self._iso()
+        async with self._db() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM matches WHERE status='pending' AND confirm_deadline <= ?",
+                    (now,),
+                )
+            ).fetchall()
+            for row in rows:
+                await db.execute(
+                    "UPDATE matches SET status='expired', closed_at=?, close_reason='timeout' WHERE id=?",
+                    (now, row["id"]),
+                )
+                await self._close_queue(db, row["player_a"], "expired")
+                await self._close_queue(db, row["player_b"], "expired")
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq IN (?,?)",
+                    (now, row["player_a"], row["player_b"]),
+                )
+            if rows:
+                await db.commit()
+                for row in rows:
+                    await self._notice(
+                        row["player_a"],
+                        "匹配确认超时，已退出本次匹配队列。如需继续请重新发送 /p 报名。",
+                        group_id=row["group_a"],
+                        fallback="你的星露谷匹配确认已超时退出——"
+                        "请加机器人为好友后重新 /p 报名。",
+                    )
+                    await self._notice(
+                        row["player_b"],
+                        "匹配确认超时，已退出本次匹配队列。如需继续请重新发送 /p 报名。",
+                        group_id=row["group_b"],
+                        fallback="你的星露谷匹配确认已超时退出——"
+                        "请加机器人为好友后重新 /p 报名。",
+                    )
+
+    async def _match_waiting(self) -> int:
+        if self._get_bot() is None:
+            return 0
+        now = self._iso()
+        async with self._db() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM queue WHERE status='waiting' AND expires_at > ? "
+                    "ORDER BY enqueued_at ASC, id ASC",
+                    (now,),
+                )
+            ).fetchall()
+            if len(rows) < 2:
+                return 0
+            banned = {
+                r["qq"]
+                for r in await (
+                    await db.execute(
+                        "SELECT qq FROM bans WHERE until='' OR until > ?", (now,)
+                    )
+                ).fetchall()
+            }
+            waiting = [r for r in rows if r["qq"] not in banned]
+            used: set[str] = set()
+            created = 0
+            for i, a in enumerate(waiting):
+                if a["qq"] in used:
+                    continue
+                for b in waiting[i + 1 :]:
+                    if b["qq"] in used:
+                        continue
+                    if not self._compatible(a, b):
+                        continue
+                    await self._create_match(db, a, b)
+                    used.add(a["qq"])
+                    used.add(b["qq"])
+                    created += 1
+                    break
+            return created
+
+    @staticmethod
+    def _gender_ok(prefer: str, gender: str) -> bool:
+        if prefer == "any":
+            return True
+        return prefer in {"male", "female"} and gender == prefer
+
+    def _wait_seconds(self, row) -> float:
+        try:
+            return max(
+                0.0,
+                (self._now() - datetime.fromisoformat(row["enqueued_at"])).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _relax_flags(self, a, b) -> dict[str, bool]:
+        wait = min(self._wait_seconds(a), self._wait_seconds(b))
+
+        def unlocked(key: str, default: int) -> bool:
+            minutes = self._cfg_int(key, default)
+            return minutes > 0 and wait >= minutes * 60
+
+        return {
+            "party_size": unlocked("relax_party_size_after_minutes", 30),
+            "modded": unlocked("relax_modded_after_minutes", 60),
+            "time_slots": unlocked("relax_time_slots_after_minutes", 90),
+        }
+
+    def _relaxed_labels(self, a, b) -> list[str]:
+        flags = self._relax_flags(a, b)
+        labels = []
+        if flags["party_size"]:
+            labels.append("人数")
+        if flags["modded"]:
+            labels.append("模式")
+        if flags["time_slots"]:
+            labels.append("时段")
+        return labels
+
+    def _compatible(self, a, b) -> bool:
+        if a["pool"] != b["pool"]:
+            return False
+        if not self._gender_ok(a["prefer_gender"], b["gender"]):
+            return False
+        if not self._gender_ok(b["prefer_gender"], a["gender"]):
+            return False
+        flags = self._relax_flags(a, b)
+        if not flags["party_size"] and a["party_size"] != b["party_size"]:
+            return False
+        if not flags["modded"] and a["modded"] != b["modded"]:
+            return False
+        if not flags["time_slots"]:
+            try:
+                slots_a = set(json.loads(a["time_slots"]))
+                slots_b = set(json.loads(b["time_slots"]))
+            except (TypeError, ValueError):
+                return False
+            if not (slots_a & slots_b):
+                return False
+        return True
+
+    async def _create_match(self, db, a, b, forced: bool = False):
+        now = self._now()
+        timeout = self._cfg_int("confirm_timeout_sec", 300)
+        deadline = now + timedelta(seconds=timeout)
+        await db.execute(
+            "UPDATE queue SET status='matched' WHERE id IN (?,?)", (a["id"], b["id"])
+        )
+        await db.execute(
+            "UPDATE players SET status='matched', updated_at=? WHERE qq IN (?,?)",
+            (self._iso(now), a["qq"], b["qq"]),
+        )
+        cursor = await db.execute(
+            """
+            INSERT INTO matches
+                (player_a, player_b, pool, modded, party_size, status, forced,
+                 confirm_a, confirm_b, created_at, confirm_deadline, group_a, group_b)
+            VALUES (?,?,?,?,?,'pending',?,0,0,?,?,?,?)
+            """,
+            (
+                a["qq"],
+                b["qq"],
+                a["pool"],
+                a["modded"],
+                a["party_size"],
+                1 if forced else 0,
+                self._iso(now),
+                self._iso(deadline),
+                a["group_id"] or "",
+                b["group_id"] or "",
+            ),
+        )
+        match_id = cursor.lastrowid
+        await db.commit()
+        logger.info(
+            "[星露谷匹配] %s #%s: %s <-> %s (%s)",
+            "强制匹配" if forced else "匹配成功",
+            match_id,
+            a["qq"],
+            b["qq"],
+            a["pool"],
+        )
+
+        minute = max(1, timeout // 60)
+        summary = self._match_summary(
+            a["pool"], a["modded"], a["time_slots"], a["party_size"]
+        )
+        name_a = a["nickname"] or a["qq"]
+        name_b = b["nickname"] or b["qq"]
+        relaxed = [] if forced else self._relaxed_labels(a, b)
+        relax_flags = {} if forced else self._relax_flags(a, b)
+        notes = []
+        if forced:
+            notes.append(
+                "⚡ 本次为管理员强制匹配：已忽略平台/模式/人数/时段/性别等条件，"
+                "请先沟通确认能否联机。"
+            )
+        elif relaxed:
+            notes.append(f"⏱ 已按等待时间放宽：{'、'.join(relaxed)}")
+        if a["party_size"] != b["party_size"]:
+            notes.append(
+                f"人数：{name_a} 目标 {a['party_size']} 人 / "
+                f"{name_b} 目标 {b['party_size']} 人"
+            )
+        if a["modded"] != b["modded"]:
+            notes.append(
+                f"模式：{name_a} {self._modded_label(a['modded'])} / "
+                f"{name_b} {self._modded_label(b['modded'])}"
+            )
+        if forced and a["pool"] != b["pool"]:
+            notes.append(
+                f"平台：{name_a} {self._pool_label(a['pool'])} / "
+                f"{name_b} {self._pool_label(b['pool'])}"
+            )
+        if not forced and relax_flags.get("time_slots"):
+            notes.append("时段：双方时段不重叠，请自行约时间")
+        detail = "\n".join(notes)
+        prefix = "⚡ 强制匹配" if forced else "🎮 匹配成功"
+
+        await self._notice(
+            a["qq"],
+            f"{prefix}！（{summary}）\n"
+            + (f"{detail}\n" if detail else "")
+            + f"对方：{name_b}（QQ：{b['qq']}）\n"
+            f"对方性别：{self._gender_label(b['gender'])}\n"
+            f"请回复 /p 确认 或 /p 拒绝（{minute} 分钟内）。",
+            group_id=a["group_id"],
+            fallback=f"你有一条星露谷匹配待确认（{minute} 分钟内有效），"
+            "但私聊发送失败——请加机器人为好友后私聊处理。",
+        )
+        await self._notice(
+            b["qq"],
+            f"{prefix}！（{summary}）\n"
+            + (f"{detail}\n" if detail else "")
+            + f"对方：{name_a}（QQ：{a['qq']}）\n"
+            f"对方性别：{self._gender_label(a['gender'])}\n"
+            f"请回复 /p 确认 或 /p 拒绝（{minute} 分钟内）。",
+            group_id=b["group_id"],
+            fallback=f"你有一条星露谷匹配待确认（{minute} 分钟内有效），"
+            "但私聊发送失败——请加机器人为好友后私聊处理。",
+        )
+        if self._cfg_bool("anonymous_notice", True):
+            if forced:
+                notice = "⚡ 管理员强制匹配了 2 位群友，请查看私聊。"
+            else:
+                notice = "🎮 有 2 位群友匹配成功，请查看私聊。"
+            group_a, group_b = str(a["group_id"] or ""), str(b["group_id"] or "")
+            if group_a:
+                await self._send_group(group_a, notice)
+            if group_b and group_b != group_a:
+                await self._send_group(group_b, notice)
+
+    async def _complete_match(self, row):
+        async with self._db() as db:
+            guard = await db.execute(
+                "UPDATE matches SET status='confirmed' WHERE id=? AND status='pending'",
+                (row["id"],),
+            )
+            if guard.rowcount != 1:
+                return
+            a = await (
+                await db.execute("SELECT * FROM players WHERE qq=?", (row["player_a"],))
+            ).fetchone()
+            b = await (
+                await db.execute("SELECT * FROM players WHERE qq=?", (row["player_b"],))
+            ).fetchone()
+            await db.execute(
+                "UPDATE matches SET status='confirmed' WHERE id=?", (row["id"],)
+            )
+            await db.execute(
+                "UPDATE players SET status='playing', updated_at=? WHERE qq IN (?,?)",
+                (self._iso(), row["player_a"], row["player_b"]),
+            )
+            await db.commit()
+
+        if a and b:
+            name_a = a["nickname"] or a["qq"]
+            name_b = b["nickname"] or b["qq"]
+            await self._notice(
+                a["qq"],
+                "✅ 双方已确认！\n"
+                f"对方：{name_b}（QQ：{b['qq']}）\n"
+                f"对方 Steam：{b['contact_steam'] or '未填'}\n"
+                "请主动加好友联机，结束后发送 /p 完成。",
+                group_id=row["group_a"],
+                fallback="你的星露谷匹配已双方确认，但私聊发送失败——"
+                "请加机器人为好友，私聊发送「/p 状态」查看对方联系方式。",
+            )
+            await self._notice(
+                b["qq"],
+                "✅ 双方已确认！\n"
+                f"对方：{name_a}（QQ：{a['qq']}）\n"
+                f"对方 Steam：{a['contact_steam'] or '未填'}\n"
+                "请主动加好友联机，结束后发送 /p 完成。",
+                group_id=row["group_b"],
+                fallback="你的星露谷匹配已双方确认，但私聊发送失败——"
+                "请加机器人为好友，私聊发送「/p 状态」查看对方联系方式。",
+            )
+
+    async def _close_queue(self, db, qq: str, status: str = "cancelled"):
+        await db.execute(
+            "UPDATE queue SET status=? WHERE id=(SELECT id FROM queue WHERE qq=? "
+            "AND status IN ('waiting','matched') ORDER BY id DESC LIMIT 1)",
+            (status, qq),
+        )
+
+    async def _requeue(self, db, qq: str):
+        now = self._now()
+        ttl = self._cfg_int("queue_ttl_sec", 259200)
+        row = await (
+            await db.execute(
+                "SELECT * FROM queue WHERE qq=? ORDER BY id DESC LIMIT 1", (qq,)
+            )
+        ).fetchone()
+        if row:
+            await db.execute(
+                "UPDATE queue SET status='waiting', enqueued_at=?, expires_at=? WHERE id=?",
+                (self._iso(now), self._iso(now + timedelta(seconds=ttl)), row["id"]),
+            )
+            await db.execute(
+                "UPDATE players SET status='queued', updated_at=? WHERE qq=?",
+                (self._iso(now), qq),
+            )
+        else:
+            player = await (
+                await db.execute("SELECT * FROM players WHERE qq=?", (qq,))
+            ).fetchone()
+            if player:
+                prev = await (
+                    await db.execute(
+                        "SELECT group_id FROM queue WHERE qq=? AND group_id != '' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (qq,),
+                    )
+                ).fetchone()
+                gid = (prev["group_id"] if prev else "") or ""
+                await db.execute(
+                    """
+                    INSERT INTO queue
+                        (qq, nickname, pool, modded, time_slots, party_size, gender,
+                         prefer_gender, group_id, enqueued_at, expires_at, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,'waiting')
+                    """,
+                    (
+                        qq,
+                        player["nickname"] or qq,
+                        player["pool"],
+                        player["modded"],
+                        player["time_slots"],
+                        player["party_size"],
+                        player["gender"],
+                        player["prefer_gender"],
+                        gid,
+                        self._iso(now),
+                        self._iso(now + timedelta(seconds=ttl)),
+                    ),
+                )
+                await db.execute(
+                    "UPDATE players SET status='queued', updated_at=? WHERE qq=?",
+                    (self._iso(), qq),
+                )
+
+    async def _is_banned(self, qq: str) -> bool:
+        async with self._db() as db:
+            row = await (
+                await db.execute("SELECT until FROM bans WHERE qq=?", (qq,))
+            ).fetchone()
+            if not row:
+                return False
+            until = row["until"] or ""
+            if until and until <= self._iso():
+                await db.execute("DELETE FROM bans WHERE qq=?", (qq,))
+                await db.commit()
+                return False
+            return True

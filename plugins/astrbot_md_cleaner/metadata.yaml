@@ -1,0 +1,6 @@
+name: "astrbot_md_cleaner"
+display_name: "Markdown清理器"
+version: "v1.0.0"
+author: "assistant"
+desc: "发送前剥离LLM回复中的Markdown语法，保证QQ纯文本显示"
+repo: ""

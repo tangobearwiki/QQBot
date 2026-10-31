@@ -1,0 +1,5 @@
+name: astrbot_plugin_model_route
+desc: 按输入模态路由模型；有效个人赞助者可将 LLM 请求优先路由至 Ark。支持 Provider、最低赞助档位及开关配置。
+version: v1.4.0
+author: ser
+repo: ""

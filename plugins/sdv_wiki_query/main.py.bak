@@ -1,0 +1,188 @@
+import asyncio
+import json
+import re
+from urllib.parse import quote, urlencode
+
+import aiohttp
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Node, Nodes, Plain
+from astrbot.api.star import Context, Star, register
+
+VANILLA_API = "https://wiki.biligame.com/stardewvalley/api.php"
+SVE_API = "https://www.p1.wiki/api.php"
+RSV_API = "https://rsv.miraheze.org/w/api.php"
+SVE_PAGE = "https://www.p1.wiki/?curid="
+RSV_PAGE = "https://rsv.miraheze.org/wiki/?curid="
+B23_API = "https://api.bilibili.com/x/share/click"
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+SS_PREFIX = re.compile(r"^ss[ \u3000]+(.+)$", re.IGNORECASE)
+
+
+async def _search_bwiki(session, keyword):
+    """原版维基（biligame）：opensearch，返回 [(标题, 长链接), ...]"""
+    params = {
+        "action": "opensearch", "search": keyword, "limit": "5", "format": "json"
+    }
+    try:
+        async with session.get(VANILLA_API, params=params, timeout=HTTP_TIMEOUT) as resp:
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning(f"[sdv_wiki] 原版维基查询失败: {e}")
+        return []
+    if not isinstance(data, list) or len(data) < 2 or not data[1]:
+        return []
+    urls = data[3] if len(data) > 3 else []
+    return [
+        (t, urls[i] if i < len(urls) and urls[i] else VANILLA_API)
+        for i, t in enumerate(data[1])
+    ]
+
+
+async def _search_mw(session, api, page_base, keyword, use_curid):
+    """通用 MediaWiki list=search（SVE/RSV），标题包含过滤，返回 [(标题, 链接), ...]
+
+    RSV (miraheze) 有 Cloudflare TLS 指纹检测，aiohttp 会被拦，
+    因此该站改用 curl 子进程请求。
+    """
+    params = {
+        "action": "query", "list": "search", "srsearch": keyword,
+        "srlimit": "5", "format": "json",
+    }
+    try:
+        if api == RSV_API:
+            data = await _curl_json(api, params)
+        else:
+            async with session.get(
+                api, params=params, timeout=HTTP_TIMEOUT
+            ) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning(f"[sdv_wiki] 维基 {api} 查询失败: {e}")
+        return []
+    hits = data.get("query", {}).get("search", []) if isinstance(data, dict) else []
+    kw = keyword.strip().lower()
+    out = []
+    for h in hits:
+        t = h.get("title", "")
+        if not t or kw not in t.strip().lower():
+            continue
+        if use_curid:
+            url = f"{page_base}{h.get('pageid', '')}"
+        else:
+            url = page_base + quote(t.replace(" ", "_"), safe="")
+        out.append((t, url))
+    return out
+
+
+async def _curl_json(url, params):
+    """通过 curl 子进程请求 JSON（绕过 Cloudflare 的 TLS 指纹检测）"""
+    qs = urlencode(params)
+    proc = await asyncio.create_subprocess_exec(
+        "curl", "-s", "--max-time", "12", "-A", UA,
+        "-H", "Accept: application/json, text/plain, */*",
+        f"{url}?{qs}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return json.loads(out.decode())
+
+
+async def _gen_b23(session, sem, url):
+    """将 biligame 长链接转为 b23.tv 短链，失败时返回原链接"""
+    async with sem:
+        try:
+            async with session.post(
+                B23_API,
+                data={
+                    "platform": "unix",
+                    "share_channel": "COPY",
+                    "share_id": "public.webview.0.0.pv",
+                    "share_mode": "4",
+                    "oid": url,
+                    "buvid": "sdvbot",
+                    "build": "6114514",
+                },
+                timeout=HTTP_TIMEOUT,
+            ) as resp:
+                data = await resp.json(content_type=None)
+            content = (data or {}).get("data", {}).get("content", "")
+            if content.startswith("https://b23.tv/"):
+                return content
+            logger.warning(f"[sdv_wiki] b23 生成异常: {data}")
+        except Exception as e:
+            logger.warning(f"[sdv_wiki] b23 生成失败({url}): {e}")
+    return url
+
+
+def _pick(results, keyword):
+    """精确匹配优先，否则取第一条最相关结果"""
+    for t, u in results:
+        if t.strip().lower() == keyword.strip().lower():
+            return t, u
+    return results[0] if results else None
+
+
+@register("sdv_wiki_query", "assistant", "星露谷 Wiki 查询插件", "2.1.0")
+class SdvWikiQuery(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_ss_query(self, event: AstrMessageEvent):
+        text = (event.message_str or "").strip()
+        m = SS_PREFIX.match(text)
+        if not m:
+            return
+        keyword = m.group(1).strip()
+        if not keyword or len(keyword) > 50:
+            yield event.plain_result("ss 关键词无效，请输入 1-50 个字符")
+            return
+
+        logger.info(f"[sdv_wiki] 收到查询: {keyword}")
+        async with aiohttp.ClientSession(headers={"User-Agent": UA}) as session:
+            vanilla, sve, rsv = await asyncio.gather(
+                _search_bwiki(session, keyword),
+                _search_mw(session, SVE_API, SVE_PAGE, keyword, use_curid=True),
+                _search_mw(session, RSV_API, RSV_PAGE, keyword, use_curid=True),
+            )
+
+            # 原版维基的所有候选链接转 b23 短链（并发限流 3）
+            sem = asyncio.Semaphore(3)
+            if vanilla:
+                vanilla = [
+                    (t, await _gen_b23(session, sem, u)) for t, u in vanilla
+                ]
+
+        wikis = [("原版", vanilla), ("SVE", sve), ("RSV", rsv)]
+        lines, nodes, total = [], [], 0
+        for name, results in wikis:
+            hit = _pick(results, keyword)
+            if hit:
+                lines.append(f"[{name}] {hit[0]}\n{hit[1]}")
+            if results:
+                total += len(results)
+                body = "\n".join(f"{t}\n{u}" for t, u in results)
+                nodes.append(
+                    Node(
+                        content=[Plain(f"【{name}维基】相关词条\n\n{body}")],
+                        name=f"{name}维基",
+                        uin=str(event.get_self_id() or "10000"),
+                    )
+                )
+
+        if not lines:
+            yield event.plain_result(f"没有找到与「{keyword}」相关的 Wiki 页面")
+            return
+
+        chain = [Plain("\n".join(lines))]
+        if total >= 2:
+            chain.append(Nodes(nodes))
+        yield event.chain_result(chain)

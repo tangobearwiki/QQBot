@@ -1,0 +1,134 @@
+import traceback
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image, Plain, Reply, Video
+from astrbot.api.star import Context, Star, register
+from astrbot.core import sp
+
+TEXT_PROVIDER_ID = "Sensenova/glm-5.2"
+MULTIMODAL_PROVIDER_ID = "Ark/ark-code-latest"
+SP_KEY = "provider_perf_chat_completion"
+EXTRA_USED_MODEL = "_model_route_used_model"
+# 模型名关键字 -> 尾部 emoji：glm 系 -> 💠；Ark/doubao 系 -> 🚢
+MODEL_EMOJI_RULES = (
+    ("glm", "💠"),
+    ("ark", "🚢"),
+    ("doubao", "🚢"),
+)
+
+
+@register(
+    "astrbot_plugin_model_route",
+    "ser",
+    "按输入模态自动路由模型：纯文本 -> Sensenova glm-5.2；多模态（图片/视频/引用图） -> Ark ark-code-latest；回复末尾以 emoji 标注实际使用的模型（💠=glm 🚢=Ark）",
+    "1.3.2",
+)
+class ModelRoutePlugin(Star):
+    """在 LLM 请求构建前按消息模态切换会话 provider，并在回复末尾以 emoji 标注实际模型。"""
+
+    def __init__(self, context: Context):
+        super().__init__(context)
+
+    # ---------- 模态路由 ----------
+
+    @staticmethod
+    def _has_media(message_components) -> bool:
+        for comp in message_components:
+            if isinstance(comp, (Image, Video)):
+                return True
+            if isinstance(comp, Reply):
+                chain = getattr(comp, "chain", None)
+                if chain and any(
+                    isinstance(sub, (Image, Video)) for sub in chain
+                ):
+                    return True
+        return False
+
+    @filter.on_llm_request()
+    async def route_by_modality(self, event: AstrMessageEvent, req):
+        try:
+            umo = event.unified_msg_origin
+            components = (
+                event.message_obj.message
+                if event.message_obj and event.message_obj.message
+                else []
+            )
+            target = (
+                MULTIMODAL_PROVIDER_ID
+                if self._has_media(components)
+                else TEXT_PROVIDER_ID
+            )
+            current = await sp.get_async("umo", umo, SP_KEY, None)
+            if current != target:
+                await sp.put_async("umo", umo, SP_KEY, target)
+                logger.info(
+                    "[model_route] %s 路由 -> %s (%s)",
+                    umo,
+                    target,
+                    "多模态" if target == MULTIMODAL_PROVIDER_ID else "纯文本",
+                )
+        except Exception:
+            logger.error("[model_route] 路由切换失败")
+            logger.error(traceback.format_exc())
+
+    # ---------- 模型标注 ----------
+
+    @filter.on_llm_response()
+    async def capture_used_model(self, event: AstrMessageEvent, resp):
+        try:
+            if getattr(resp, "role", "") == "err":
+                return
+            model = None
+            raw = getattr(resp, "raw_completion", None)
+            if raw is not None:
+                model = getattr(raw, "model", None)
+            if not model:
+                current = await sp.get_async("umo", event.unified_msg_origin, SP_KEY, None)
+                model = current.rsplit("/", 1)[-1] if current else None
+            event.set_extra(EXTRA_USED_MODEL, model)
+        except Exception:
+            logger.error("[model_route] 记录模型名失败")
+            logger.error(traceback.format_exc())
+
+    @filter.on_decorating_result()
+    async def append_model_tag(self, event: AstrMessageEvent):
+        try:
+            model = event.get_extra(EXTRA_USED_MODEL)
+            emoji = self._emoji_for(model)
+            if not emoji:
+                return
+            result = event.get_result()
+            if not result or not result.chain:
+                return
+            chain = result.chain
+            logger.debug(
+                "[model_route] decorating 链结构: %s",
+                [
+                    f"{type(seg).__name__}"
+                    + (f"({seg.text[:12]!r})" if isinstance(seg, Plain) else "")
+                    for seg in chain
+                ],
+            )
+            # 关键：从链尾往前找最后一个"非空白文字段"，把 emoji 拼进它的 text。
+            # 绝不新起独立 Plain 段——含 At/文件/转发的链会被适配器逐段发送，
+            # 独立 Plain 段会变成一条单独的消息。
+            for seg in reversed(chain):
+                if isinstance(seg, Plain) and seg.text and seg.text.strip():
+                    seg.text = seg.text + emoji
+                    return
+            # 整条链没有文字段（纯文件/图片）：不加标注，保持安静
+        except Exception:
+            logger.error("[model_route] 追加模型标注失败")
+            logger.error(traceback.format_exc())
+
+    @staticmethod
+    def _emoji_for(model) -> str | None:
+        m = (model or "").lower()
+        for keyword, emoji in MODEL_EMOJI_RULES:
+            if keyword in m:
+                return emoji
+        return None
+
+    async def terminate(self):
+        pass

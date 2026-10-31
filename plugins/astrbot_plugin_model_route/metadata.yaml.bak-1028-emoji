@@ -1,0 +1,5 @@
+name: astrbot_plugin_model_route
+desc: 按输入模态自动路由模型：纯文本使用 Sensenova glm-5.2，多模态（图片/视频/引用图）使用 Ark ark-code-latest；glm-5.2 失败时自动回落 Ark；回复末尾标注实际使用的模型
+version: v1.2.0
+author: ser
+repo: ""

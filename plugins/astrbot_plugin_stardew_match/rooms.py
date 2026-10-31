@@ -1,0 +1,730 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timedelta
+
+
+class RoomManager:
+    """按「目标人数 / 我方人数」聚合房间，满员即匹配。"""
+
+    def __init__(self, plugin):
+        self.p = plugin
+        # join 的「读房间→判断→插入」必须原子，防止并发加入导致超员
+        self.join_lock = asyncio.Lock()
+        # 已发过「即将过期」预警的房间 id
+        self.warned_rooms: set[int] = set()
+
+    async def _notice(self, member, text: str, fallback: str) -> None:
+        """关键通知：私聊优先，失败则群内 @ 兜底（不透露其他成员信息）。"""
+        ok = await self.p._send_private(
+            member["qq"], text, group_id=member["group_id"]
+        )
+        if not ok and member["group_id"]:
+            await self.p._send_group_at(
+                member["group_id"], member["qq"], fallback
+            )
+
+    # ------------------------------------------------------------------ #
+    # 查询
+    # ------------------------------------------------------------------ #
+    async def active(self, qq: str) -> bool:
+        async with self.p._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT rm.id FROM room_members rm "
+                    "JOIN rooms r ON r.id = rm.room_id "
+                    "WHERE rm.qq=? AND rm.active=1 AND r.status IN ('open','full') "
+                    "ORDER BY rm.id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+        return row is not None
+
+    async def status(self, qq: str) -> str | None:
+        async with self.p._db() as db:
+            room = await (
+                await db.execute(
+                    "SELECT r.* FROM room_members rm "
+                    "JOIN rooms r ON r.id = rm.room_id "
+                    "WHERE rm.qq=? AND rm.active=1 AND r.status IN ('open','full') "
+                    "ORDER BY rm.id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+            if not room:
+                return None
+            members = await self._members(db, room["id"])
+        total = sum(m["have"] for m in members)
+        lines = [
+            f"🏠 房间 #{room['id']}（{total}/{room['target']}）",
+            f"平台：{self.p._pool_label(room['pool'])} / {self.p._modded_label(room['modded'])}",
+            f"时段：{self.p._slots_label(room['time_slots'])}",
+        ]
+        if room["status"] == "full":
+            lines.append("状态：已满员，可以直接开玩。")
+        else:
+            waited = ""
+            try:
+                created = datetime.fromisoformat(room["created_at"])
+                mins = max(0, int((self.p._now() - created).total_seconds() // 60))
+                if mins >= 60:
+                    waited = f"（本房已等 {mins // 60} 小时 {mins % 60} 分钟）"
+                elif mins > 0:
+                    waited = f"（本房已等 {mins} 分钟）"
+            except (TypeError, ValueError):
+                waited = ""
+            lines.append(f"还差 {max(0, room['target'] - total)} 人{waited}。")
+        lines.append("成员：")
+        for m in members:
+            lines.append(
+                f"- {m['nickname'] or m['qq']}（QQ {m['qq']}，{m['have']} 人）"
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    # 报名加入
+    # ------------------------------------------------------------------ #
+    async def join(
+        self,
+        event,
+        qq: str,
+        data: dict,
+        group_id: str = "",
+        nickname: str = "",
+    ):
+        target = int(data["target"])
+        have = int(data["have"])
+        party = {
+            "qq": qq,
+            "nickname": nickname or qq,
+            "have": have,
+            "need": target - have,
+            "pool": data["pool"],
+            "modded": data["modded"],
+            "gender": data["gender"],
+            "prefer_gender": data["prefer_gender"],
+            "contact_qq": data["contact_qq"],
+            "contact_steam": data["contact_steam"],
+            "slots": list(data["slots"]),
+            "group_id": group_id or "",
+        }
+        async with self.join_lock:
+            async with self.p._db() as db:
+                rooms = await (
+                    await db.execute(
+                        "SELECT * FROM rooms WHERE status='open' AND target=? "
+                        "AND pool=? AND modded=? AND expires_at > ? "
+                        "ORDER BY id ASC",
+                        (target, data["pool"], data["modded"], self.p._iso()),
+                    )
+                ).fetchall()
+                best = None
+                best_members = None
+                for room in rooms:
+                    members = await self._members(db, room["id"])
+                    if self._accepts(room, members, party):
+                        if best is None or sum(m["have"] for m in members) > sum(
+                            m["have"] for m in best_members
+                        ):
+                            best = room
+                            best_members = members
+                if best is not None:
+                    await self._add_member(db, best, best_members, party)
+                    return
+                await self._create_room(db, party)
+                return
+
+    async def join_specific(
+        self,
+        qq: str,
+        data: dict,
+        room_id: int,
+        group_id: str = "",
+        nickname: str = "",
+        enforce_prefs: bool = True,
+    ) -> tuple[bool, str]:
+        """加入指定房间（房间推荐流程）。返回 (是否成功, 失败提示)。
+
+        data 只需要 pool/modded/slots/have/gender/prefer_gender/contact_qq/contact_steam，
+        target 以目标房间的为准。
+        enforce_prefs=True 校验时段+性别偏好（系统推荐场景）；
+        False 仅校验平台与容量（用户主动加入，偏好不拦人）。
+        """
+        party = {
+            "qq": qq,
+            "nickname": nickname or qq,
+            "have": int(data["have"]),
+            "need": 0,
+            "pool": data["pool"],
+            "modded": data["modded"],
+            "gender": data["gender"],
+            "prefer_gender": data["prefer_gender"],
+            "contact_qq": data["contact_qq"],
+            "contact_steam": data["contact_steam"],
+            "slots": list(data["slots"]),
+            "group_id": group_id or "",
+        }
+        async with self.join_lock:
+            async with self.p._db() as db:
+                room = await (
+                    await db.execute(
+                        "SELECT * FROM rooms WHERE id=? AND status='open'",
+                        (room_id,),
+                    )
+                ).fetchone()
+                if room is None:
+                    return False, "该房间刚刚关闭或已满员。"
+                if room["pool"] != party["pool"]:
+                    return False, (
+                        "平台不同无法一起联机"
+                        "（PC / 手机 / Switch / 主机不互通）。"
+                    )
+                party["need"] = room["target"] - party["have"]
+                members = await self._members(db, room["id"])
+                total = sum(m["have"] for m in members)
+                if total + party["have"] > room["target"]:
+                    return False, "该房间刚好被其他群友加满了。"
+                if enforce_prefs and not self._accepts(room, members, party):
+                    return False, (
+                        "该房间的可玩时段与你的报名时段没有交集，无法加入；"
+                        "可发送 /p 房间 查看时段匹配的房间。"
+                    )
+                await self._add_member(db, room, members, party)
+                return True, ""
+
+    async def detach_member(self, room_id: int, qq: str) -> None:
+        """把成员从指定房间移除（推荐转房流程专用），并通知剩余成员。
+
+        若房间因此无人，自动解散（与 leave 行为一致）。
+        """
+        async with self.p._db() as db:
+            row = await (
+                await db.execute(
+                    "SELECT id FROM room_members WHERE room_id=? AND qq=? AND active=1",
+                    (room_id, qq),
+                )
+            ).fetchone()
+            if row is None:
+                return
+            await db.execute("UPDATE room_members SET active=0 WHERE id=?", (row["id"],))
+            remaining = await self._members(db, room_id)
+            if not remaining:
+                await db.execute(
+                    "UPDATE rooms SET status='cancelled' WHERE id=?", (room_id,)
+                )
+            await db.commit()
+        if not remaining:
+            return
+        for m in remaining:
+            await self._notice(
+                m,
+                "一位成员通过系统推荐转移到了其他房间。",
+                "你的星露谷匹配房间有一名成员转移到了其他房间——"
+                "请加机器人为好友后私聊发送 /p 状态 查看最新成员。",
+            )
+
+    def _accepts(self, room, members, party) -> bool:
+        total = sum(m["have"] for m in members)
+        if total + party["have"] > room["target"]:
+            return False
+        try:
+            room_slots = set(json.loads(room["time_slots"]))
+        except (TypeError, ValueError):
+            room_slots = set()
+        if not (room_slots & set(party["slots"])):
+            return False
+        for member in members:
+            if not self.p._gender_ok(
+                party["prefer_gender"], member["gender"]
+            ):
+                return False
+            if not self.p._gender_ok(
+                member["prefer_gender"], party["gender"]
+            ):
+                return False
+        return True
+
+    async def _create_room(self, db, party) -> None:
+        now = self.p._now()
+        ttl = self.p._cfg_int("queue_ttl_sec", 259200)
+        cursor = await db.execute(
+            """
+            INSERT INTO rooms
+                (target, pool, modded, time_slots, status, created_at, expires_at, group_id)
+            VALUES (?,?,?,?,'open',?,?,?)
+            """,
+            (
+                party["have"] + party["need"],
+                party["pool"],
+                party["modded"],
+                json.dumps(party["slots"], ensure_ascii=False),
+                self.p._iso(now),
+                self.p._iso(now + timedelta(seconds=ttl)),
+                party["group_id"],
+            ),
+        )
+        # pool/modded 从 party 里没有；由 join 调用前补进 party
+        room_id = cursor.lastrowid
+        await self._insert_member(db, room_id, party)
+        await db.commit()
+        await self._notice(
+            party,
+            f"🏠 房间已创建（{party['have']}/{party['have'] + party['need']}）\n"
+            f"目标 {party['have'] + party['need']} 人，还差 {party['need']} 人。\n"
+            "有人加入会通知你。",
+            "星露谷匹配报名成功，房间已创建；但私聊发送失败——请先加机器人为好友，"
+            "再私聊发送「/p 状态」查看房间详情。",
+        )
+
+    async def _insert_member(self, db, room_id: int, party) -> None:
+        await db.execute(
+            """
+            INSERT INTO room_members
+                (room_id, qq, nickname, have, need, gender, prefer_gender,
+                 contact_qq, contact_steam, group_id, joined_at, active)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,1)
+            """,
+            (
+                room_id,
+                party["qq"],
+                party["nickname"],
+                party["have"],
+                party["need"],
+                party["gender"],
+                party["prefer_gender"],
+                party["contact_qq"],
+                party["contact_steam"],
+                party["group_id"],
+                self.p._iso(),
+            ),
+        )
+
+    async def _members(self, db, room_id: int):
+        return await (
+            await db.execute(
+                "SELECT * FROM room_members WHERE room_id=? AND active=1 "
+                "ORDER BY id ASC",
+                (room_id,),
+            )
+        ).fetchall()
+
+    async def _add_member(self, db, room, members, party) -> None:
+        await self._insert_member(db, room["id"], party)
+        try:
+            old_slots = set(json.loads(room["time_slots"]))
+        except (TypeError, ValueError):
+            old_slots = set()
+        new_slots = old_slots & set(party["slots"])
+        await db.execute(
+            "UPDATE rooms SET time_slots=? WHERE id=?",
+            (json.dumps(sorted(new_slots), ensure_ascii=False), room["id"]),
+        )
+        await db.execute(
+            "UPDATE players SET status='room', updated_at=? WHERE qq=?",
+            (self.p._iso(), party["qq"]),
+        )
+        await db.commit()
+        updated = await self._members(db, room["id"])
+        total = sum(m["have"] for m in updated)
+        if total == room["target"]:
+            await self._finish_room(db, room, updated, forced=False)
+        else:
+            await self._notify_join(room, members, updated, party)
+
+    async def _notify_join(self, room, old_members, all_members, new_party) -> None:
+        total = sum(m["have"] for m in all_members)
+        missing = max(0, room["target"] - total)
+        new_line = (
+            f"{new_party['nickname']}（QQ {new_party['qq']}，"
+            f"{new_party['have']} 人）"
+        )
+        for member in old_members:
+            await self._notice(
+                member,
+                f"📥 新成员加入\n"
+                f"{new_line}\n"
+                f"当前 {total}/{room['target']}，还差 {missing} 人。",
+                "有新成员加入了你的星露谷匹配房间，但私聊发送失败——"
+                "请加机器人为好友后私聊发送「/p 状态」查看详情。",
+            )
+        lines = [
+            f"- {m['nickname'] or m['qq']}（QQ {m['qq']}，{m['have']} 人）"
+            for m in all_members
+        ]
+        await self._notice(
+            new_party,
+            f"✅ 已加入房间 #{room['id']}（{total}/{room['target']}）\n"
+            f"还差 {missing} 人。\n"
+            "成员：\n" + "\n".join(lines),
+            "你已加入星露谷匹配房间；但私聊发送失败——"
+            "请加机器人为好友后私聊发送「/p 状态」查看房间详情。",
+        )
+
+    async def _finish_room(self, db, room, members, forced: bool = False) -> None:
+        total = sum(m["have"] for m in members)
+        first, second = members[0], members[1] if len(members) > 1 else members[0]
+        await db.execute(
+            """
+            INSERT INTO matches
+                (room_id, player_a, player_b, pool, modded, party_size, status,
+                 forced, confirm_a, confirm_b, created_at, confirm_deadline, group_a, group_b)
+            VALUES (?,?,?,?,?,?,'playing',?,0,0,?,'',?,?)
+            """,
+            (
+                room["id"],
+                first["qq"],
+                second["qq"],
+                room["pool"],
+                room["modded"],
+                room["target"],
+                1 if forced else 0,
+                self.p._iso(),
+                first["group_id"] or "",
+                second["group_id"] or "",
+            ),
+        )
+        await db.execute(
+            "UPDATE rooms SET status='full' WHERE id=?", (room["id"],)
+        )
+        qqs = [m["qq"] for m in members]
+        placeholders = ",".join("?" for _ in qqs)
+        await db.execute(
+            f"UPDATE players SET status='playing', updated_at=? WHERE qq IN ({placeholders})",
+            [self.p._iso(), *qqs],
+        )
+        await db.commit()
+        self.p.logger.info(
+            "[星露谷匹配] 房间满员 #%s: %s (%s人)",
+            room["id"],
+            [m["qq"] for m in members],
+            total,
+        )
+        lines = [
+            f"- {m['nickname'] or m['qq']}（QQ {m['qq']}，{m['have']} 人）"
+            for m in members
+        ]
+        prefix = "⚡ 管理员强制满员" if forced else "🎉 房间已满"
+        body = (
+            f"{prefix}（{total}/{room['target']}）\n"
+            + "\n".join(lines)
+            + "\n可以开始联机了，结束后发 /p 完成。"
+        )
+        for m in members:
+            await self._notice(
+                m,
+                body,
+                "🎉 你的星露谷匹配房间已满员！但私聊发送失败——"
+                "请加机器人为好友，私聊发送「/p 状态」查看队友联系方式。",
+            )
+        if self.p._cfg_bool("anonymous_notice", True):
+            groups = {m["group_id"] for m in members if m["group_id"]}
+            notice = (
+                "⚡ 管理员强制满员了一个房间，请查看私聊。"
+                if forced
+                else "🎮 有一个房间满员了，请查看私聊。"
+            )
+            for gid in groups:
+                await self.p._send_group(gid, notice)
+
+    # ------------------------------------------------------------------ #
+    # 退出 / 完成
+    # ------------------------------------------------------------------ #
+    async def leave(self, qq: str) -> str | None:
+        async with self.p._db() as db:
+            member = await (
+                await db.execute(
+                    "SELECT rm.*, r.status AS room_status, r.target, r.id AS room_id "
+                    "FROM room_members rm JOIN rooms r ON r.id=rm.room_id "
+                    "WHERE rm.qq=? AND rm.active=1 AND r.status IN ('open','full') "
+                    "ORDER BY rm.id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+            if not member:
+                return None
+            room_id = member["room_id"]
+            await db.execute(
+                "UPDATE room_members SET active=0 WHERE id=?", (member["id"],)
+            )
+            if member["room_status"] == "full":
+                await db.execute(
+                    "UPDATE matches SET status='cancelled', closed_at=?, "
+                    "close_reason='member_left' WHERE room_id=? AND status='playing'",
+                    (self.p._iso(), room_id),
+                )
+                await db.execute(
+                    "UPDATE rooms SET status='open' WHERE id=?", (room_id,)
+                )
+            remaining = await self._members(db, room_id)
+            room = await (
+                await db.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
+            ).fetchone()
+            if not remaining:
+                await db.execute(
+                    "UPDATE rooms SET status='cancelled' WHERE id=?", (room_id,)
+                )
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                    (self.p._iso(), qq),
+                )
+                await db.commit()
+                return "已退出房间。"
+            total = sum(m["have"] for m in remaining)
+            await db.execute(
+                "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                (self.p._iso(), qq),
+            )
+            if member["room_status"] == "full":
+                for m in remaining:
+                    await db.execute(
+                        "UPDATE players SET status='room', updated_at=? WHERE qq=?",
+                        (self.p._iso(), m["qq"]),
+                    )
+            await db.commit()
+            for m in remaining:
+                await self._notice(
+                    m,
+                    f"房间成员退出，当前 {total}/{room['target']}，"
+                    f"还差 {max(0, room['target'] - total)} 人。",
+                    "你的星露谷匹配房间有成员退出，但私聊发送失败——"
+                    "请加机器人为好友后私聊发送「/p 状态」查看进度。",
+                )
+            return "已退出房间，房间继续等待其他成员。" if member["room_status"] == "open" else "已退出房间，房间重新开放。"
+
+    async def complete(self, qq: str) -> str | None:
+        async with self.p._db() as db:
+            member = await (
+                await db.execute(
+                    "SELECT rm.*, r.target, r.id AS room_id "
+                    "FROM room_members rm JOIN rooms r ON r.id=rm.room_id "
+                    "WHERE rm.qq=? AND rm.active=1 AND r.status='full' "
+                    "ORDER BY rm.id DESC LIMIT 1",
+                    (qq,),
+                )
+            ).fetchone()
+            if not member:
+                return None
+            room_id = member["room_id"]
+            members = await self._members(db, room_id)
+            await db.execute(
+                "UPDATE matches SET status='completed', closed_at=?, "
+                "close_reason='completed' WHERE room_id=? AND status='playing'",
+                (self.p._iso(), room_id),
+            )
+            await db.execute(
+                "UPDATE rooms SET status='completed' WHERE id=?", (room_id,)
+            )
+            qqs = [m["qq"] for m in members]
+            placeholders = ",".join("?" for _ in qqs)
+            await db.execute(
+                f"UPDATE players SET status='idle', updated_at=? WHERE qq IN ({placeholders})",
+                [self.p._iso(), *qqs],
+            )
+            await db.commit()
+            for m in members:
+                if m["qq"] != qq:
+                    await self._notice(
+                        m,
+                        "对方已结束本次房间匹配，欢迎再次使用 /p 报名。",
+                        "你的星露谷匹配房间已有人结束本次联机——"
+                        "请加机器人为好友后可重新 /p 报名。",
+                    )
+            return "已结束本次房间匹配。"
+
+    # ------------------------------------------------------------------ #
+    # 过期 / 管理
+    # ------------------------------------------------------------------ #
+    async def expire(self) -> int:
+        now = self.p._iso()
+        async with self.p._db() as db:
+            rooms = await (
+                await db.execute(
+                    "SELECT * FROM rooms WHERE status='open' AND expires_at <= ?",
+                    (now,),
+                )
+            ).fetchall()
+            count = 0
+            for room in rooms:
+                members = await self._members(db, room["id"])
+                await db.execute(
+                    "UPDATE rooms SET status='expired' WHERE id=?", (room["id"],)
+                )
+                for m in members:
+                    await db.execute(
+                        "UPDATE room_members SET active=0 WHERE id=?", (m["id"],)
+                    )
+                    await db.execute(
+                        "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                        (now, m["qq"]),
+                    )
+                await db.commit()
+                for m in members:
+                    await self._notice(
+                        m,
+                        "房间等待超时，已自动取消，请重新 /p 报名。",
+                        "你的星露谷匹配房间等待超时已自动取消——"
+                        "请加机器人为好友后重新 /p 报名。",
+                    )
+                count += 1
+            return count
+
+    async def list_open_rooms(self, limit: int = 10) -> list[dict]:
+        """当前等待中的房间摘要——仅供 /p 房间 展示，不含任何成员联系方式。"""
+        async with self.p._db() as db:
+            rooms = await (
+                await db.execute(
+                    "SELECT * FROM rooms WHERE status='open' AND expires_at > ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (self.p._iso(), limit),
+                )
+            ).fetchall()
+            result: list[dict] = []
+            for room in rooms:
+                members = await self._members(db, room["id"])
+                result.append(
+                    {
+                        "id": room["id"],
+                        "pool": room["pool"],
+                        "modded": room["modded"],
+                        "time_slots": room["time_slots"],
+                        "target": room["target"],
+                        "total": sum(m["have"] for m in members),
+                        "created_at": room["created_at"],
+                    }
+                )
+            return result
+
+    async def warn_expiring(self) -> int:
+        """过期前 12 小时提醒一次 open 房间的所有成员（每房只提醒一次）。"""
+        now = self.p._now()
+        threshold = (now + timedelta(hours=12)).isoformat()
+        notified = 0
+        async with self.p._db() as db:
+            rooms = await (
+                await db.execute(
+                    "SELECT * FROM rooms WHERE status='open' "
+                    "AND expires_at > ? AND expires_at <= ?",
+                    (now.isoformat(), threshold),
+                )
+            ).fetchall()
+            for room in rooms:
+                rid = room["id"]
+                if rid in self.warned_rooms:
+                    continue
+                members = await self._members(db, rid)
+                if not members:
+                    continue
+                self.warned_rooms.add(rid)
+                missing = max(0, room["target"] - sum(m["have"] for m in members))
+                for m in members:
+                    await self._notice(
+                        m,
+                        f"⏰ 房间 #{rid} 将在 12 小时内过期，目前还差 {missing} 人。\n"
+                        "等不到人可发 /p 取消 后重新 /p 报名调整条件。",
+                        "你的星露谷匹配房间即将过期——"
+                        "请加机器人为好友后私聊发送 /p 状态 查看。",
+                    )
+                notified += len(members)
+        return notified
+
+    async def stats(self) -> list[dict]:
+        async with self.p._db() as db:
+            rooms = await (
+                await db.execute(
+                    "SELECT * FROM rooms WHERE status='open' ORDER BY id ASC"
+                )
+            ).fetchall()
+            result = []
+            now = self.p._now()
+            for room in rooms:
+                members = await self._members(db, room["id"])
+                total = sum(m["have"] for m in members)
+                try:
+                    wait = max(
+                        0,
+                        int(
+                            (
+                                now - datetime.fromisoformat(room["created_at"])
+                            ).total_seconds()
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    wait = 0
+                result.append(
+                    {
+                        "id": room["id"],
+                        "target": room["target"],
+                        "current": total,
+                        "missing": max(0, room["target"] - total),
+                        "pool": self.p._pool_label(room["pool"]),
+                        "modded": self.p._modded_label(room["modded"]),
+                        "slots": self.p._slots_label(room["time_slots"]),
+                        "wait_seconds": wait,
+                        "members": [
+                            {
+                                "qq": m["qq"],
+                                "nickname": m["nickname"] or m["qq"],
+                                "have": m["have"],
+                                "gender": self.p._gender_label(m["gender"]),
+                                "prefer_gender": self.p._prefer_label(
+                                    m["prefer_gender"]
+                                ),
+                            }
+                            for m in members
+                        ],
+                    }
+                )
+            return result
+
+    async def force_fill(self, room_id: int):
+        async with self.p._db() as db:
+            room = await (
+                await db.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
+            ).fetchone()
+            if not room:
+                return False, "房间不存在"
+            if room["status"] != "open":
+                return False, "房间不在开放状态"
+            members = await self._members(db, room_id)
+            if not members:
+                return False, "房间没有成员"
+            await self._finish_room(db, room, members, forced=True)
+            return True, f"已强制满员房间 #{room_id}"
+
+    async def dissolve(self, room_id: int):
+        async with self.p._db() as db:
+            room = await (
+                await db.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
+            ).fetchone()
+            if not room:
+                return False, "房间不存在"
+            members = await self._members(db, room_id)
+            await db.execute(
+                "UPDATE rooms SET status='cancelled' WHERE id=?", (room_id,)
+            )
+            await db.execute(
+                "UPDATE matches SET status='cancelled', closed_at=?, "
+                "close_reason='dissolved' WHERE room_id=? AND status='playing'",
+                (self.p._iso(), room_id),
+            )
+            for m in members:
+                await db.execute(
+                    "UPDATE room_members SET active=0 WHERE id=?", (m["id"],)
+                )
+                await db.execute(
+                    "UPDATE players SET status='idle', updated_at=? WHERE qq=?",
+                    (self.p._iso(), m["qq"]),
+                )
+            await db.commit()
+            for m in members:
+                await self._notice(
+                    m,
+                    "房间已被管理员解散，请重新 /p 报名。",
+                    "管理员解散了你所在的星露谷匹配房间——"
+                    "请加机器人为好友后重新 /p 报名。",
+                )
+            return True, f"已解散房间 #{room_id}"
+
+    async def kick_qq(self, qq: str) -> None:
+        await self.leave(qq)

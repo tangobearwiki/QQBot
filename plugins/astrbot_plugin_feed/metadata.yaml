@@ -1,0 +1,4 @@
+name: astrbot_plugin_feed
+author: Kimi
+desc: 投喂赞助与米饼余量统计。每消耗一千万 LLM token 消耗一块米饼，支持管理员设置、增加、查询和重置。
+version: v1.1.0

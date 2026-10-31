@@ -1,0 +1,5 @@
+name: astrbot_plugin_wake_ban
+author: serUNzmcsYXp2R1
+desc: 对话唤醒权限管理：/ban 禁用某人的对话唤醒权限，/unban 解除，/banlist 查看名单。被禁用户 @ 机器人不再触发对话，ss 查询、smapi 日志分析等工具功能不受影响。
+version: v1.2.0
+repo: https://github.com/serUNzmcsYXp2R1/astrbot_plugin_wake_ban

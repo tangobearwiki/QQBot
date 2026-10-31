@@ -1,0 +1,32 @@
+name: astrbot_plugin_tts_rvc
+display_name: TTS-RVC 语音回复
+short_desc: 用你自己的 RVC 模型，把机器人回复变成语音
+desc: |
+  让机器人用**你自己的 RVC 模型**说话。
+
+  插件本身很轻：只负责拦截回复、调用本机声音服务、失败自动回退文字。
+  真正的「文字 → 干声 → RVC 换声」由配套服务 **tts-rvc-service** 完成，
+  服务通过一条命令安装在本机，默认只监听 127.0.0.1。
+
+  特性：
+  - 私聊默认语音、群聊用 `/打开语音` 单独开启
+  - 会话级音色切换（`/voice_list`、`/voice_set`）
+  - 情绪映射：开心 / 兴奋 / 温柔（按关键词，不额外调用模型）
+  - 合成失败自动回退文字，不吞消息
+  - 服务不可用时自动熔断，不拖慢聊天
+  - 支持任意 RVC v2 模型（.pth + .index）
+
+  需要先安装配套声音服务，步骤见 README。
+version: 1.1.0
+author: cyrene
+repo: https://github.com/kuqiwang/astrbot_plugin_tts_rvc
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - tts
+  - voice
+  - rvc
+  - 语音
+  - 变声
+social_link: https://github.com/kuqiwang

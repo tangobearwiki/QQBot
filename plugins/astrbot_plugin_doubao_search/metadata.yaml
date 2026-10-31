@@ -1,0 +1,6 @@
+id: astrbot_plugin_doubao_search
+name: 豆包搜索（联网搜索）
+author: serUNzmcsYXp2R1
+desc: 基于 Agent Plan 豆包搜索 API 的联网搜索。/联网搜索 开/关 按会话启用；开启后模型自动检索实时信息；未开启时遇到难解问题会主动询问是否联网搜索。
+version: v1.0.0
+repo: local

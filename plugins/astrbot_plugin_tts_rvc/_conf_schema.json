@@ -1,0 +1,74 @@
+{
+  "enabled": {
+    "description": "启用语音回复",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后所有回复恢复纯文字，插件不再请求声音服务。"
+  },
+  "service_url": {
+    "description": "声音服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:9880/tts",
+    "hint": "配套 tts-rvc-service 的 /tts 接口。填到 /tts 或只填 http://127.0.0.1:9880 都可以，修改后无需重启插件。"
+  },
+  "voice_id": {
+    "description": "默认 RVC 音色 id",
+    "type": "string",
+    "default": "",
+    "hint": "留空则用服务端默认（服务端未设置时自动选第一个模型）。填了则所有会话默认用它，可用 /voice_set 单独覆盖。"
+  },
+  "private_only": {
+    "description": "私聊默认发语音",
+    "type": "bool",
+    "default": true,
+    "hint": "私聊没有单独设置时是否发语音。"
+  },
+  "group_default": {
+    "description": "群聊默认发语音",
+    "type": "bool",
+    "default": false,
+    "hint": "群聊没有单独设置时是否发语音。建议保持关闭，让群友用 /打开语音 自己开。"
+  },
+  "admin_only": {
+    "description": "只有管理员能切换",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后只有 AstrBot 管理员能使用 /打开语音、/关闭语音、/voice_set。"
+  },
+  "dual_output": {
+    "description": "文字和语音都发",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时只发语音；开启时先发文字再发语音。"
+  },
+  "only_llm": {
+    "description": "只转换模型回复",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后指令回复、插件通知等文本不会被转成语音。"
+  },
+  "min_chars": {
+    "description": "最短字数",
+    "type": "int",
+    "default": 2,
+    "hint": "短于这个字数的回复不转语音，避免「嗯」「好」也发一条语音。"
+  },
+  "max_chars": {
+    "description": "最长字数",
+    "type": "int",
+    "default": 150,
+    "hint": "超过这个字数的回复不转语音，避免合成时间过长。"
+  },
+  "timeout": {
+    "description": "服务超时（秒）",
+    "type": "float",
+    "default": 90.0,
+    "hint": "首次加载 RVC 模型较慢，可适当调大。"
+  },
+  "cache": {
+    "description": "缓存合成结果",
+    "type": "bool",
+    "default": true,
+    "hint": "同一段文字 + 同一音色只合成一次，重复回复更快。缓存在系统临时目录，最多保留 24 小时。"
+  }
+}

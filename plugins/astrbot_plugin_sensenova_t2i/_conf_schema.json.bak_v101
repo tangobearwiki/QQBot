@@ -1,0 +1,17 @@
+{
+  "api_key": {
+    "description": "SenseNova API Key（sk- 开头）",
+    "type": "string",
+    "default": ""
+  },
+  "model": {
+    "description": "生图模型 ID",
+    "type": "string",
+    "default": "sensenova-u1.5-lite"
+  },
+  "timeout": {
+    "description": "生图请求超时（秒）",
+    "type": "int",
+    "default": 180
+  }
+}

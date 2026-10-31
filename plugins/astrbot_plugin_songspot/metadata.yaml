@@ -1,0 +1,5 @@
+name: astrbot_plugin_songspot
+desc: 点播服务器本地歌曲（RVC 翻唱发布渠道），/点播 关键词 以语音发送
+version: 1.0.0
+author: xiaonvpu
+repo: local

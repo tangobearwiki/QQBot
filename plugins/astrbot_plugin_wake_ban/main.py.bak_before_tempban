@@ -1,0 +1,224 @@
+import json
+import os
+import time
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At
+from astrbot.api.star import Context, Star, register
+
+DATA_DIR = "./data/plugin_data/astrbot_plugin_wake_ban"
+DATA_FILE = os.path.join(DATA_DIR, "banned.json")
+
+
+@register(
+    "astrbot_plugin_wake_ban",
+    "serUNzmcsYXp2R1",
+    "对话唤醒权限管理",
+    "1.1.1",
+    "https://github.com/serUNzmcsYXp2R1/astrbot_plugin_wake_ban",
+)
+class WakeBanPlugin(Star):
+    """管理用户/群聊的对话唤醒权限。
+
+    用户级（仅管理员）：
+      /ban @某人 [理由]   —— 禁止目标用户的对话唤醒权限
+      /ban QQ号 [理由]    —— 同上，直接指定 QQ 号
+      /unban @某人|QQ号   —— 解除禁用
+    群级（仅管理员，须在群聊中使用）：
+      /ban group [理由]   —— 禁用本群所有人的对话唤醒
+      /unban group        —— 恢复本群对话唤醒
+    通用：
+      /banlist            —— 查看禁用名单
+
+    被禁用户 / 被禁群聊内 @ 机器人时不再触发 LLM 对话；ss 查询、smapi
+    日志分析等工具功能不受影响。
+    """
+
+    def __init__(self, context: Context):
+        super().__init__(context)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self.banned_users: dict[str, dict] = {}
+        self.banned_groups: dict[str, dict] = {}
+        self._load()
+
+    # ---------- 存储 ----------
+
+    def _load(self):
+        try:
+            if os.path.exists(DATA_FILE):
+                raw = json.load(open(DATA_FILE, encoding="utf-8"))
+                if isinstance(raw, dict) and "users" in raw:
+                    self.banned_users = raw.get("users", {}) or {}
+                    self.banned_groups = raw.get("groups", {}) or {}
+                else:  # 兼容 v1.0 纯用户字典
+                    self.banned_users = raw or {}
+        except Exception as e:
+            logger.error(f"[wake_ban] 读取禁用名单失败: {e}")
+
+    def _save(self):
+        # 先写临时文件再原子替换，避免进程中断截断名单文件
+        try:
+            tmp_file = DATA_FILE + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"users": self.banned_users, "groups": self.banned_groups},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, DATA_FILE)
+        except Exception as e:
+            logger.error(f"[wake_ban] 写入禁用名单失败: {e}")
+
+    # ---------- 工具 ----------
+
+    def _self_id(self, event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_self_id() or "")
+        except Exception:
+            return ""
+
+    def _parse_target(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """返回 (QQ号, 名字)。优先取 At 段, 其次取纯数字参数。"""
+        chain = event.message_obj.message if event.message_obj else []
+        self_id = self._self_id(event)
+        for seg in chain or []:
+            if isinstance(seg, At) and str(seg.qq) not in ("all", self_id):
+                return str(seg.qq), (seg.name or "")
+        parts = (event.message_str or "").split()
+        for p in parts[1:]:
+            if p.isdigit():
+                return p, ""
+        return "", ""
+
+    def _now(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M")
+
+    # ---------- 命令 ----------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("ban")
+    async def ban(self, event: AstrMessageEvent):
+        """禁用对话唤醒: /ban @某人|QQ号 [理由] 或 /ban group [理由]"""
+        parts = (event.message_str or "").split()
+        sub = (parts[1].lower() if len(parts) > 1 else "")
+        if sub in ("group", "群"):
+            gid = event.get_group_id()
+            if not gid:
+                yield event.plain_result("⚠️ 群级禁用需要在群聊中使用 /ban group。")
+                return
+            reason = " ".join(parts[2:]).strip()
+            self.banned_groups[str(gid)] = {
+                "reason": reason,
+                "by": str(event.get_sender_id()),
+                "time": self._now(),
+            }
+            self._save()
+            logger.info(f"[wake_ban] 群 {gid} 对话唤醒已被禁用")
+            yield event.plain_result("🚫 已禁用**本群**的对话唤醒权限（工具类查询不受影响，/unban group 可恢复）。")
+            return
+
+        qq, name = self._parse_target(event)
+        if not qq:
+            yield event.plain_result("用法：/ban @某人 [理由] / /ban QQ号 [理由] / /ban group [理由]")
+            return
+        reason_parts = (event.message_str or "").split()
+        # 取目标之后的文本作为理由
+        if reason_parts and reason_parts[1].isdigit():
+            reason = " ".join(reason_parts[2:]).strip()
+        else:
+            reason = " ".join(reason_parts[2:]).strip() if len(reason_parts) > 2 else ""
+        self.banned_users[qq] = {
+            "name": name,
+            "reason": reason,
+            "by": str(event.get_sender_id()),
+            "time": self._now(),
+        }
+        self._save()
+        logger.info(f"[wake_ban] 用户 {qq} 对话唤醒已被禁用")
+        yield event.plain_result(f"🚫 已禁用 {name or qq} 的对话唤醒权限。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("unban")
+    async def unban(self, event: AstrMessageEvent):
+        """解除禁用: /unban @某人|QQ号 或 /unban group"""
+        parts = (event.message_str or "").split()
+        sub = (parts[1].lower() if len(parts) > 1 else "")
+        if sub in ("group", "群"):
+            gid = str(event.get_group_id() or "")
+            if gid and gid in self.banned_groups:
+                del self.banned_groups[gid]
+                self._save()
+                yield event.plain_result("✅ 已恢复本群的对话唤醒权限。")
+            else:
+                yield event.plain_result("本群不在禁用名单中。")
+            return
+
+        qq, name = self._parse_target(event)
+        if not qq:
+            yield event.plain_result("用法：/unban @某人|QQ号 或 /unban group")
+            return
+        if qq in self.banned_users:
+            del self.banned_users[qq]
+            self._save()
+            yield event.plain_result(f"✅ 已恢复 {name or qq} 的对话唤醒权限。")
+        else:
+            yield event.plain_result(f"{name or qq} 不在禁用名单中。")
+
+    @filter.command("banlist")
+    async def banlist(self, event: AstrMessageEvent):
+        """查看禁用名单"""
+        lines = ["📋 对话唤醒禁用名单"]
+        if self.banned_groups:
+            lines.append("\n【群级】")
+            for gid, info in self.banned_groups.items():
+                reason = f"｜理由：{info['reason']}" if info.get("reason") else ""
+                lines.append(f"  群 {gid}{reason}｜{info.get('time', '')}")
+        if self.banned_users:
+            lines.append("\n【用户】")
+            for qq, info in self.banned_users.items():
+                name = info.get("name") or ""
+                reason = f"｜理由：{info['reason']}" if info.get("reason") else ""
+                lines.append(f"  {qq} {name}{reason}｜{info.get('time', '')}")
+        if not self.banned_groups and not self.banned_users:
+            lines.append("（空）")
+        yield event.plain_result("\n".join(lines))
+
+    # ---------- 拦截 ----------
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def gate(self, event: AstrMessageEvent):
+        """被禁用户 @ 机器人（或私聊对话）/ 被禁群聊内 @ 机器人时拦截。"""
+        try:
+            sender = str(event.get_sender_id() or "")
+            gid = str(event.get_group_id() or "")
+            user_blocked = bool(sender) and sender in self.banned_users
+            group_blocked = bool(gid) and gid in self.banned_groups
+            if not user_blocked and not group_blocked:
+                return
+            text = (event.message_str or "").strip()
+            if text.startswith("/"):
+                return  # 命令消息放行
+            is_group = bool(gid)
+            chain = event.message_obj.message if event.message_obj else []
+            self_id = self._self_id(event)
+            has_at_self = any(
+                isinstance(seg, At) and str(seg.qq) == self_id for seg in (chain or [])
+            )
+            if is_group:
+                # 群内：仅拦截 @ 机器人的消息（ss/smapi 等无 @ 的工具消息不受影响）
+                if has_at_self:
+                    who = "群聊整体" if group_blocked else sender
+                    logger.info(f"[wake_ban] 已拦截被禁对象 {who} 在群 {gid} 的对话唤醒")
+                    yield event.plain_result("🚫 对话唤醒权限已被限制，如有疑问请联系群管理员。")
+                    event.stop_event()
+            elif user_blocked:
+                # 私聊：仅用户级禁用生效
+                logger.info(f"[wake_ban] 已拦截被禁用户 {sender} 的私聊对话唤醒")
+                yield event.plain_result("🚫 你的对话唤醒权限已被限制，如有疑问请联系群管理员。")
+                event.stop_event()
+        except Exception as e:
+            logger.error(f"[wake_ban] 拦截器异常: {e}")

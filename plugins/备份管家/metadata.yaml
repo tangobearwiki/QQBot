@@ -1,0 +1,5 @@
+name: 备份管家
+desc: 备份管家：定时备份 AstrBot 数据与 NapCat 配置，按计划私聊推送备份包
+version: 2.0.0
+author: xiaonvpu
+repo: local

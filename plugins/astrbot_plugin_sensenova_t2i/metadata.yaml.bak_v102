@@ -1,0 +1,6 @@
+id: astrbot_plugin_sensenova_t2i
+name: 商汤日日新生图（SenseNova）
+author: serUNzmcsYXp2R1
+desc: 基于商汤日日新 SenseNova U1.5 的 AI 生图。/画图 命令直接生图，支持比例与高清参数；注册 sensenova_text_to_image 工具，配合生图意图引导，群友自然语言表达生图需求时自动调用工具生图。
+version: v1.0.2
+repo: local

@@ -1,0 +1,56 @@
+{
+  "admins": {
+    "description": "管理员 QQ 列表",
+    "type": "list",
+    "default": [],
+    "hint": "拥有封禁/解封/统计/解散权限的 QQ 号；群管理员也可使用统计类命令。"
+  },
+  "confirm_timeout_sec": {
+    "description": "匹配确认时限（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "匹配成功后双方需在该时间内确认，超时自动重新排队。"
+  },
+  "cooldown_sec": {
+    "description": "拒绝后的冷却时间（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "拒绝匹配的一方在该时间内不能再次报名。"
+  },
+  "queue_ttl_sec": {
+    "description": "房间等待有效期（秒）",
+    "type": "int",
+    "default": 259200,
+    "hint": "默认 3 天（259200 秒）；房间超过该时间仍未满员会自动取消。"
+  },
+  "match_interval_sec": {
+    "description": "后台检查间隔（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "后台每隔多少秒检查一次过期房间。"
+  },
+  "relax_party_size_after_minutes": {
+    "description": "等待多少分钟后放宽人数条件",
+    "type": "int",
+    "default": 30,
+    "hint": "匹配双方等待均超过该分钟数后允许目标人数不同；填 0 表示不启用。"
+  },
+  "relax_modded_after_minutes": {
+    "description": "等待多少分钟后放宽原版/模组条件",
+    "type": "int",
+    "default": 60,
+    "hint": "匹配双方等待均超过该分钟数后允许原版与模组混排；填 0 表示不启用。"
+  },
+  "relax_time_slots_after_minutes": {
+    "description": "等待多少分钟后放宽时段条件",
+    "type": "int",
+    "default": 90,
+    "hint": "匹配双方等待均超过该分钟数后允许时段不重叠；填 0 表示不启用。"
+  },
+  "anonymous_notice": {
+    "description": "群内匿名提示",
+    "type": "bool",
+    "default": true,
+    "hint": "房间满员后是否在成员所在群发送匿名提示。"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "api_key": {
+    "description": "豆包搜索 API Key（留空则自动读取主配置 Ark provider_source 的 key）",
+    "type": "string",
+    "default": ""
+  },
+  "default_enabled": {
+    "description": "默认开启联网搜索：开启后所有会话默认可用，无需逐个 /联网搜索 开（单会话仍可手动关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "会话内 /联网搜索 开/关 的优先级高于此项"
+  },
+  "count": {
+    "description": "搜索返回条数（1-10）",
+    "type": "int",
+    "default": 6
+  },
+  "content_len": {
+    "description": "单条结果正文截断长度（字符）",
+    "type": "int",
+    "default": 400
+  },
+  "search_badge": {
+    "description": "已联网声明：实际调用过搜索的回复末尾会追加此声明，留空则不追加",
+    "type": "string",
+    "default": "🌐 已联网搜索"
+  }
+}

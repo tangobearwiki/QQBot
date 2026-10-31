@@ -1,0 +1,5 @@
+name: sdv_wiki_query
+desc: 星露谷 Wiki 查询：ss 关键词同时检索原版/SVE/RSV 维基，本地词条模糊匹配（错别字/拼音容错）
+version: v2.2.0
+author: assistant
+repo: https://github.com/AstrBotDevs/AstrBot

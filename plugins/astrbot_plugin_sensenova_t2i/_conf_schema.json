@@ -1,0 +1,27 @@
+{
+  "api_key": {
+    "description": "SenseNova API Key（sk- 开头）",
+    "type": "string",
+    "default": ""
+  },
+  "model": {
+    "description": "生图模型 ID（/画图 与 sensenova_text_to_image 使用）",
+    "type": "string",
+    "default": "sensenova-u1.5-lite"
+  },
+  "edit_model": {
+    "description": "改图模型 ID（/改图 与 sensenova_image_edit 使用，需支持参考图）",
+    "type": "string",
+    "default": "sensenova-u1.5-lite"
+  },
+  "timeout": {
+    "description": "生图/改图请求超时（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "nl_intent_guide": {
+    "description": "自然语言意图引导：开启后会在大模型系统提示词中注入生图/改图指令，确保检测到意图时稳定调用对应工具",
+    "type": "bool",
+    "default": true
+  }
+}

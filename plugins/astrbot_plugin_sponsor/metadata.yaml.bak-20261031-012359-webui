@@ -1,0 +1,4 @@
+name: astrbot_plugin_sponsor
+author: Kimi
+desc: 透明的赞助权益、感谢名单、月度收支与功能投票；管理员人工确认到账，不自动收款。
+version: v1.0.0

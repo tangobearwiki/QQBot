@@ -1,0 +1,27 @@
+{
+  "enable_passive": {
+    "description": "被动检测：群聊出现 smapi.io/log 链接时自动分析（被@时改由大模型工具处理，不重复回复）",
+    "type": "bool",
+    "default": true
+  },
+  "enable_ai_analysis": {
+    "description": "AI 自然语言分析：用大模型把日志综合成口语化诊断+修复建议（失败自动退回规则版输出）",
+    "type": "bool",
+    "default": true
+  },
+  "ai_max_chars": {
+    "description": "AI 回复的最大字数（防止刷屏）",
+    "type": "int",
+    "default": 400
+  },
+  "cooldown_seconds": {
+    "description": "同一会话被动分析冷却时间（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "max_issue_lines": {
+    "description": "问题清单最多列出的条数（规则版输出用）",
+    "type": "int",
+    "default": 8
+  }
+}
