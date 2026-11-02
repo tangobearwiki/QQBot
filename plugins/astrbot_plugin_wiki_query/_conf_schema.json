@@ -1,0 +1,23 @@
+{
+  "default_source": {
+    "type": "string",
+    "description": "默认 Wiki 源",
+    "default": "all",
+    "options": ["all", "stardew", "sve"]
+  },
+  "bypass_cloudflare": {
+    "type": "bool",
+    "description": "默认使用 curl_cffi 模拟 Chrome 请求；普通 B 站/SVE 请求通常无需开启",
+    "default": false
+  },
+  "result_limit": {
+    "type": "int",
+    "description": "每个源返回的结果数（1-50），查询全部时最多为两倍",
+    "default": 5
+  },
+  "timeout": {
+    "type": "int",
+    "description": "请求超时秒数（1-120）",
+    "default": 25
+  }
+}

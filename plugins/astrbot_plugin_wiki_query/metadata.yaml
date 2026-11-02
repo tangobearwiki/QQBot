@@ -1,0 +1,5 @@
+name: astrbot_plugin_wiki_query
+display_name: 星露谷 Wiki 查询
+desc: 星露谷原版和 SVE 的公开 Wiki 查询，返回标题、链接和摘要列表，支持 Chrome 模拟请求
+version: v1.0.0
+author: kaer-nk
